@@ -28,6 +28,7 @@
     </nav>
 
     <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <button class="logout-button" type="submit">Keluar</button>
     </form>
 
@@ -128,44 +129,4 @@
 
       </div>
 
-      <div class="detail-actions">
-
-        <a href="/clients/{{ data.get('id') }}/edit"
-           class="primary-button">
-          Edit Data Klien
-        </a>
-
-        <form method="post"
-              action="/clients/{{ data.get('id') }}/status">
-
-          <input type="hidden"
-                 name="csrf_token"
-                 value="{{ csrf_token }}">
-
-          {% if data.get('status') == 'active' %}
-          <input type="hidden" name="status" value="inactive">
-          <button type="submit" class="danger-button">
-            Nonaktifkan Klien
-          </button>
-          {% else %}
-          <input type="hidden" name="status" value="active">
-          <button type="submit" class="primary-button">
-            Aktifkan Klien
-          </button>
-          {% endif %}
-
-        </form>
-
-      </div>
-
-    </section>
-
-    <footer>
-      © 2026 SIMPATI Universal · Developer Console
-    </footer>
-
-  </main>
-
-</div>
-
-{% endblock %}
+      <div class="detail
