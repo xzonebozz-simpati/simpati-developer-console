@@ -25,10 +25,7 @@ app = FastAPI(
 
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv(
-        "SESSION_SECRET",
-        "CHANGE-ME-BEFORE-DEPLOYMENT",
-    ),
+    secret_key=os.environ["SESSION_SECRET"],
     session_cookie="simpati_developer_session",
     max_age=60 * 60 * 8,
     same_site="lax",
