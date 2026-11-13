@@ -241,7 +241,7 @@ def create_module_page(module):
 
         return render_page(
             request,
-            "module.html",
+            "modul.html",
             active_slug=module["slug"],
             module=module,
         )
