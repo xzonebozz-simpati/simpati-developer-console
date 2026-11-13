@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Masuk | SIMPATI Developer Console{% endblock %}
+{% block body %}
+<main class="login-shell">
+  <section class="login-card">
+    <div class="brand-mark">S</div>
+    <p class="eyebrow">SIMPATI UNIVERSAL</p>
+    <h1>Developer Console</h1>
+    <p class="muted">Pusat kendali ekosistem SIMPATI</p>
+    {% if error %}<div class="alert">{{ error }}</div>{% endif %}
+    {% if not configured %}
+      <div class="alert">Akun belum dikonfigurasi. Atur DEVELOPER_USERNAME, DEVELOPER_PASSWORD, dan SESSION_SECRET pada environment aplikasi.</div>
+    {% endif %}
+    <form method="post" action="/login">
+      <label for="username">Nama pengguna</label>
+      <input id="username" name="username" autocomplete="username" required>
+      <label for="password">Kata sandi</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit">Masuk ke Console</button>
+    </form>
+    <p class="footnote">Akses khusus pemilik/pengelola platform.</p>
+  </section>
+</main>
+{% endblock %}
