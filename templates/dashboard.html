@@ -1,33 +1,101 @@
 {% extends "base.html" %}
 {% block title %}Dashboard | SIMPATI Developer Console{% endblock %}
+
 {% block body %}
 <div class="app-shell">
+
   <aside class="sidebar">
-    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
-    <nav>
-      {% for label, description, state in menu_items %}
-      <div class="nav-item {% if state == 'active' %}selected{% endif %}">
-        <span>{{ label }}</span>
-        {% if state == 'planned' %}<small>Segera</small>{% endif %}
+    <div class="sidebar-brand">
+      <span class="brand-mark small">S</span>
+      <div>
+        <strong>SIMPATI</strong>
+        <small>DEVELOPER CONSOLE</small>
       </div>
+    </div>
+
+    <nav>
+      {% for item in menu_items %}
+      <a href="{{ item.path }}"
+         class="nav-item {% if active_slug == item.slug %}selected{% endif %}">
+        <span>{{ item.label }}</span>
+      </a>
       {% endfor %}
     </nav>
-    <form method="post" action="/logout" class="logout-form"><button class="logout-button" type="submit">Keluar</button></form>
+
+    <form method="post" action="/logout" class="logout-form">
+      <button class="logout-button" type="submit">Keluar</button>
+    </form>
   </aside>
+
   <main class="main-content">
-    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>Dashboard</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PUSAT KENDALI PENGEMBANG</p>
+        <h1>Dashboard</h1>
+      </div>
+      <div class="user-chip">
+        Developer: {{ username }}
+      </div>
+    </header>
+
     <section class="welcome-panel">
-      <div><p class="eyebrow light">SIMPATI UNIVERSAL</p><h2>Selamat datang di Developer Console</h2><p>Pusat pengelolaan layanan, instalasi, dan konfigurasi ekosistem SIMPATI.</p></div>
-      <span class="status-pill">Fondasi 0.1.0</span>
+      <div>
+        <p class="eyebrow light">SIMPATI UNIVERSAL</p>
+        <h2>Selamat datang di Developer Console</h2>
+        <p>
+          Pusat pengelolaan layanan, instalasi, dan konfigurasi
+          ekosistem SIMPATI.
+        </p>
+      </div>
+      <span class="status-pill">Fondasi 0.2.0</span>
     </section>
-    <section class="section-heading"><div><h2>Ekosistem SIMPATI</h2><p class="muted">Ruang pengelolaan aplikasi yang akan diintegrasikan bertahap.</p></div></section>
+
+    <section class="section-heading">
+      <div>
+        <h2>Ekosistem SIMPATI</h2>
+        <p class="muted">
+          Ruang pengelolaan aplikasi yang akan diintegrasikan bertahap.
+        </p>
+      </div>
+    </section>
+
     <div class="system-grid">
-      <article class="system-card"><span class="card-index">01</span><h3>License Manager</h3><p>Layanan lisensi tetap berdiri sebagai aplikasi terpisah.</p><span class="tag">Integrasi belum aktif</span></article>
-      <article class="system-card"><span class="card-index">02</span><h3>SIMPATI CORE</h3><p>Sumber data anggota, pengurus, dan struktur organisasi.</p><span class="tag">Integrasi belum aktif</span></article>
-      <article class="system-card"><span class="card-index">03</span><h3>SIMPATI SURVEY</h3><p>Pengelolaan proses dan data survei.</p><span class="tag">Integrasi belum aktif</span></article>
-      <article class="system-card"><span class="card-index">04</span><h3>SIMPATI PROPOSAL</h3><p>Pembuatan dan pengelolaan proposal.</p><span class="tag">Integrasi belum aktif</span></article>
+
+      <article class="system-card">
+        <span class="card-index">01</span>
+        <h3>License Manager</h3>
+        <p>Layanan lisensi sebagai aplikasi terpisah.</p>
+        <span class="tag">Integrasi belum aktif</span>
+      </article>
+
+      <article class="system-card">
+        <span class="card-index">02</span>
+        <h3>SIMPATI CORE</h3>
+        <p>Sumber data anggota, pengurus, dan struktur organisasi.</p>
+        <span class="tag">Integrasi belum aktif</span>
+      </article>
+
+      <article class="system-card">
+        <span class="card-index">03</span>
+        <h3>SIMPATI SURVEY</h3>
+        <p>Pengelolaan proses dan data survei.</p>
+        <span class="tag">Integrasi belum aktif</span>
+      </article>
+
+      <article class="system-card">
+        <span class="card-index">04</span>
+        <h3>SIMPATI PROPOSAL</h3>
+        <p>Pembuatan dan pengelolaan proposal.</p>
+        <span class="tag">Integrasi belum aktif</span>
+      </article>
+
     </div>
-    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+
+    <footer>
+      © 2026 SIMPATI Universal · Developer Console
+    </footer>
+
   </main>
 </div>
 {% endblock %}
