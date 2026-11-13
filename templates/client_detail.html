@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+
+{% block title %}Detail Klien | SIMPATI Developer Console{% endblock %}
+
+{% block body %}
+
+{% set data = client or {} %}
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+
+    <div class="sidebar-brand">
+      <span class="brand-mark small">S</span>
+      <div>
+        <strong>SIMPATI</strong>
+        <small>DEVELOPER CONSOLE</small>
+      </div>
+    </div>
+
+    <nav>
+      {% for item in menu_items %}
+      <a href="{{ item.path }}"
+         class="nav-item {% if active_slug == item.slug %}selected{% endif %}">
+        <span>{{ item.label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+
+    <form method="post" action="/logout" class="logout-form">
+      <button class="logout-button" type="submit">Keluar</button>
+    </form>
+
+  </aside>
+
+  <main class="main-content">
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PUSAT KENDALI PENGEMBANG</p>
+        <h1>Detail Klien</h1>
+      </div>
+
+      <div class="user-chip">
+        Developer: {{ username }}
+      </div>
+    </header>
+
+    {% if notice %}
+    <div class="alert success-alert">{{ notice }}</div>
+    {% endif %}
+
+    {% if error %}
+    <div class="alert">{{ error }}</div>
+    {% endif %}
+
+    <section class="section-heading">
+      <div>
+        <h2>{{ data.get('client_name', '-') }}</h2>
+        <p class="muted">Informasi lengkap klien SIMPATI.</p>
+      </div>
+
+      <a href="/clients" class="secondary-button">
+        Kembali ke Daftar
+      </a>
+    </section>
+
+    <section class="client-detail-panel">
+
+      <div class="client-detail-header">
+        <div>
+          <span class="detail-label">Kode Klien</span>
+          <strong>{{ data.get('client_code', '-') }}</strong>
+        </div>
+
+        <div>
+          <span class="detail-label">Status</span>
+
+          {% if data.get('status') == 'active' %}
+          <span class="client-status active">Aktif</span>
+          {% else %}
+          <span class="client-status inactive">Nonaktif</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="detail-grid">
+
+        <div class="detail-item">
+          <span>Nama Organisasi</span>
+          <strong>{{ data.get('client_name', '-') }}</strong>
+        </div>
+
+        <div class="detail-item">
+          <span>Penanggung Jawab</span>
+          <strong>{{ data.get('contact_person') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item">
+          <span>Email</span>
+          <strong>{{ data.get('email') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item">
+          <span>Nomor Telepon</span>
+          <strong>{{ data.get('phone') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item full-width">
+          <span>Alamat</span>
+          <strong>{{ data.get('address') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item full-width">
+          <span>Catatan</span>
+          <strong>{{ data.get('notes') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item">
+          <span>Tanggal Dibuat</span>
+          <strong>{{ data.get('created_at') or '-' }}</strong>
+        </div>
+
+        <div class="detail-item">
+          <span>Pembaruan Terakhir</span>
+          <strong>{{ data.get('updated_at') or '-' }}</strong>
+        </div>
+
+      </div>
+
+      <div class="detail-actions">
+
+        <a href="/clients/{{ data.get('id') }}/edit"
+           class="primary-button">
+          Edit Data Klien
+        </a>
+
+        <form method="post"
+              action="/clients/{{ data.get('id') }}/status">
+
+          <input type="hidden"
+                 name="csrf_token"
+                 value="{{ csrf_token }}">
+
+          {% if data.get('status') == 'active' %}
+          <input type="hidden" name="status" value="inactive">
+          <button type="submit" class="danger-button">
+            Nonaktifkan Klien
+          </button>
+          {% else %}
+          <input type="hidden" name="status" value="active">
+          <button type="submit" class="primary-button">
+            Aktifkan Klien
+          </button>
+          {% endif %}
+
+        </form>
+
+      </div>
+
+    </section>
+
+    <footer>
+      © 2026 SIMPATI Universal · Developer Console
+    </footer>
+
+  </main>
+
+</div>
+
+{% endblock %}
