@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Detail Instalasi | SIMPATI Developer Console{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <aside class="sidebar"><div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div><nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav><form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form></aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>Detail Instalasi</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    {% if notice %}<div class="alert">{{ notice }}</div>{% endif %}
+    <section class="section-heading"><div><h2>{{ installation.installation_name }}</h2><p class="muted">{{ installation.installation_code }}</p></div><a href="/installations/{{ installation.id }}/edit" class="primary-button">Edit Instalasi</a></section>
+    <section class="client-form-panel"><div class="form-grid">
+      <div class="form-group"><label>Klien</label><strong>{{ client.client_name if client else 'Klien tidak ditemukan' }}</strong></div>
+      <div class="form-group"><label>Kode Klien</label><strong>{{ client.client_code if client else '-' }}</strong></div>
+      <div class="form-group"><label>Produk</label><strong>{{ installation.product_code }}</strong></div>
+      <div class="form-group"><label>Versi</label><strong>{{ installation.version or '-' }}</strong></div>
+      <div class="form-group"><label>Lingkungan</label><strong>{{ installation.environment }}</strong></div>
+      <div class="form-group"><label>Status</label><strong>{{ installation.status|capitalize }}</strong></div>
+      <div class="form-group full-width"><label>Alamat aplikasi</label>{% if installation.app_url %}<a href="{{ installation.app_url }}" target="_blank" rel="noopener">{{ installation.app_url }}</a>{% else %}<strong>-</strong>{% endif %}</div>
+      <div class="form-group"><label>Tanggal instalasi</label><strong>{{ installation.installed_at or '-' }}</strong></div>
+      <div class="form-group"><label>Dibuat</label><strong>{{ installation.created_at or '-' }}</strong></div>
+      <div class="form-group full-width"><label>Catatan</label><p>{{ installation.notes or '-' }}</p></div>
+    </div>
+    <hr>
+    <form method="post" action="/installations/{{ installation.id }}/status" class="form-actions"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><label for="status">Ubah status</label><select id="status" name="status">{% for item in ['pending','active','maintenance','failed','inactive'] %}<option value="{{ item }}" {% if installation.status == item %}selected{% endif %}>{{ item|capitalize }}</option>{% endfor %}</select><button class="primary-button" type="submit">Perbarui Status</button><a href="/installations" class="secondary-button">Kembali</a></form>
+    </section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+{% endblock %}

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}{{ page_title }} | SIMPATI Developer Console{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
+    <nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav>
+    <form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form>
+  </aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>{{ page_title }}</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    <section class="section-heading"><div><h2>Informasi Instalasi</h2><p class="muted">Hubungkan produk SIMPATI dengan klien yang terdaftar.</p></div></section>
+    {% if errors %}<div class="alert"><strong>Periksa kembali data berikut:</strong><ul>{% for item in errors %}<li>{{ item }}</li>{% endfor %}</ul></div>{% endif %}
+    <section class="client-form-panel">
+      {% if not clients %}<div class="alert">Belum ada klien aktif. Aktifkan atau daftarkan klien terlebih dahulu melalui Manajemen Klien.</div>{% endif %}
+      <form method="post" action="{{ form_action }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-grid">
+          <div class="form-group full-width"><label for="client_id">Klien *</label><select id="client_id" name="client_id" required><option value="">Pilih klien</option>{% for item in clients %}<option value="{{ item.id }}" {% if installation.get('client_id','')|string == item.id|string %}selected{% endif %}>{{ item.client_code }} · {{ item.client_name }}{% if item.status != 'active' %} ({{ item.status }}){% endif %}</option>{% endfor %}</select></div>
+          <div class="form-group"><label for="installation_code">Kode Instalasi *</label><input id="installation_code" name="installation_code" maxlength="50" required value="{{ installation.get('installation_code','') }}" placeholder="CONTOH: SURVEY-555-001"></div>
+          <div class="form-group"><label for="installation_name">Nama Instalasi *</label><input id="installation_name" name="installation_name" maxlength="150" required value="{{ installation.get('installation_name','') }}"></div>
+          <div class="form-group"><label for="product_code">Produk *</label><select id="product_code" name="product_code" required><option value="">Pilih produk</option>{% for item in products %}<option value="{{ item }}" {% if installation.get('product_code') == item %}selected{% endif %}>{{ item }}</option>{% endfor %}</select></div>
+          <div class="form-group"><label for="version">Versi aplikasi</label><input id="version" name="version" maxlength="30" value="{{ installation.get('version') or '' }}" placeholder="Contoh: 1.0.0"></div>
+          <div class="form-group full-width"><label for="app_url">Alamat aplikasi</label><input type="url" id="app_url" name="app_url" value="{{ installation.get('app_url') or '' }}" placeholder="https://aplikasi.example.com"></div>
+          <div class="form-group"><label for="environment">Lingkungan *</label><select id="environment" name="environment">{% for item in environments %}<option value="{{ item }}" {% if installation.get('environment','production') == item %}selected{% endif %}>{{ item|capitalize }}</option>{% endfor %}</select></div>
+          <div class="form-group"><label for="status">Status *</label><select id="status" name="status">{% for item in statuses %}<option value="{{ item }}" {% if installation.get('status','pending') == item %}selected{% endif %}>{{ item|capitalize }}</option>{% endfor %}</select></div>
+          <div class="form-group"><label for="installed_at">Tanggal instalasi</label><input type="datetime-local" id="installed_at" name="installed_at" value="{{ installation.get('installed_at','')[:16] if installation.get('installed_at') else '' }}"></div>
+          <div class="form-group full-width"><label for="notes">Catatan</label><textarea id="notes" name="notes" rows="4">{{ installation.get('notes') or '' }}</textarea></div>
+        </div>
+        <div class="form-actions"><a href="/installations" class="secondary-button">Batal</a><button type="submit" class="primary-button" {% if not clients %}disabled{% endif %}>Simpan Instalasi</button></div>
+      </form>
+    </section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+{% endblock %}

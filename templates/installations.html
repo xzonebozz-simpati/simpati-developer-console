@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Manajemen Instalasi | SIMPATI Developer Console{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
+    <nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav>
+    <form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form>
+  </aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>Manajemen Instalasi</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    <section class="section-heading"><div><h2>Daftar Instalasi</h2><p class="muted">Kelola pemasangan produk SIMPATI pada setiap klien.</p></div></section>
+    {% if notice %}<div class="alert">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert"><strong>Data belum dapat dimuat:</strong> {{ error }}</div>{% endif %}
+    <section class="stats-grid">
+      <div class="stat-card"><span>Total ditampilkan</span><strong>{{ counts.total }}</strong></div>
+      <div class="stat-card"><span>Aktif</span><strong>{{ counts.active }}</strong></div>
+      <div class="stat-card"><span>Menunggu</span><strong>{{ counts.pending }}</strong></div>
+      <div class="stat-card"><span>Nonaktif</span><strong>{{ counts.inactive }}</strong></div>
+    </section>
+    <section class="client-toolbar">
+      <form method="get" action="/installations" class="client-search">
+        <input type="search" name="q" value="{{ keyword }}" placeholder="Cari kode, nama instalasi, atau klien...">
+        <select name="status_filter"><option value="">Semua status</option>{% for item in ['pending','active','maintenance','failed','inactive'] %}<option value="{{ item }}" {% if status_filter == item %}selected{% endif %}>{{ item|capitalize }}</option>{% endfor %}</select>
+        <button class="secondary-button" type="submit">Cari</button>
+      </form>
+      <a href="/installations/new" class="primary-button">+ Tambah Instalasi</a>
+    </section>
+    <section class="table-panel"><div class="table-responsive"><table>
+      <thead><tr><th>Kode</th><th>Nama Instalasi</th><th>Klien</th><th>Produk</th><th>Versi</th><th>Lingkungan</th><th>Status</th><th>Aksi</th></tr></thead>
+      <tbody>
+      {% for item in installations %}
+        <tr><td><strong>{{ item.installation_code }}</strong></td><td>{{ item.installation_name }}</td><td>{{ item.client_name }}<small>{{ item.client_code }}</small></td><td>{{ item.product_code }}</td><td>{{ item.version or '-' }}</td><td>{{ item.environment }}</td><td><span class="status-badge status-{{ item.status }}">{{ item.status|capitalize }}</span></td><td><a href="/installations/{{ item.id }}">Detail</a> · <a href="/installations/{{ item.id }}/edit">Edit</a></td></tr>
+      {% else %}<tr><td colspan="8" class="empty-state">Belum ada data instalasi.</td></tr>{% endfor %}
+      </tbody>
+    </table></div></section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+{% endblock %}
