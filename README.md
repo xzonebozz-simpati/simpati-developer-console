@@ -22,14 +22,86 @@ tidak mengakses database atau License Manager secara langsung.
   sistem operasi. Password Developer tidak disimpan. Jika secure credential
   store tidak tersedia, aplikasi menampilkan error dan tidak menggunakan
   penyimpanan teks biasa sebagai fallback.
-- Status koneksi memeriksa endpoint publik `GET /health/live`; request gagal
-  atau API tidak aktif ditampilkan sebagai status terputus.
-- Dashboard memuat jumlah Tenant dari `GET /tenants`, jumlah instalasi dari
-  metadata `total` pada `GET /tenants/{tenant_id}/installations`, jumlah modul
+- Status monitoring memeriksa endpoint publik `GET /health/live` dan hanya
+  menyatakan Universal API online jika respons health berstatus `RUNNING`.
+  Pemeriksaan database memakai `GET /health/ready`: `ONLINE/CONNECTED`
+  menandakan siap dan HTTP 503 menandakan readiness gagal. Endpoint `/health`
+  adalah alias yang kompatibel. Jika endpoint tidak tersedia atau request
+  gagal tanpa readiness status, database ditampilkan `N/D`, bukan sehat.
+  Waktu respons dan waktu pemeriksaan terakhir untuk kedua pemeriksaan
+  ditampilkan; pemeriksaan memakai timer koneksi yang sudah ada serta tombol
+  manual Dashboard, tanpa menambah polling berkala.
+- Dashboard menghitung Tenant berstatus `ACTIVE` dari `GET /tenants`,
+  instalasi berstatus `ACTIVE` dari daftar instalasi per-Tenant, modul aktif
   dari `GET /modules`, dan aktivitas terbaru dari `GET /auth/audit-logs`.
-  Data dashboard dapat dimuat ulang. Jika request gagal, status dan detail
-  error ditampilkan; kartu lisensi ditandai belum tersedia karena Universal
-  API saat ini belum menyediakan endpoint lisensi.
+  Waktu respons tiap pemeriksaan data ditampilkan pada detail metrik.
+  Status database hanya berasal dari `/health/ready`; Dashboard tidak
+  menyimpulkannya dari `/health/live`. Jika request gagal, status dan detail
+  error ditampilkan; kartu lisensi tetap `N/D` karena API belum menyediakan
+  endpoint lisensi.
+- Menu Audit Log membaca `GET /auth/audit-logs` dengan permission
+  `auth.audit.read`. Endpoint mendukung `limit` dan `offset` (maksimal 100)
+  serta parameter opsional `tenant_id`; daftar diurutkan terbaru lebih dulu.
+  Respons tidak menyediakan `total`, filter periode/aktor/aktivitas, pencarian
+  server-side, maupun endpoint detail per log. Data aktor hanya berisi
+  `actor_type` dan `actor_id`, bukan nama/username. Detail `details` ikut
+  dikirim pada daftar dan ditampilkan dari catatan yang sudah dimuat; hasil
+  aktivitas hanya dapat ditampilkan bila ada di `details`.
+  Desktop menyediakan pencarian dan filter lokal hanya pada halaman yang
+  sedang dimuat, serta pagination `limit`/`offset`; karena tidak ada total,
+  tombol berikutnya tersedia selama halaman berisi penuh dan total catatan
+  tidak ditampilkan. Menu ini hanya baca; tidak ada operasi ubah/hapus audit.
+- Menu Manajemen Pengguna Developer memakai endpoint akun Developer, terpisah
+  dari akun admin Tenant: `GET /auth/developers` dan
+  `POST /auth/developer/register` serta `PATCH /auth/developers/{user_id}`
+  (`auth.developers.manage`). Endpoint daftar memakai `limit`/`offset` tanpa
+  total; data daftar sudah memuat detail profil, status, role, dan timestamp,
+  karena API tidak menyediakan endpoint detail, pencarian, edit username,
+  riwayat login, atau penghapusan akun.
+  Akun baru tidak menerima role secara otomatis. Penetapan role akun memakai
+  `PUT /auth/developers/{user_id}/roles`; katalog role dan permission hanya
+  tersedia bagi `auth.roles.manage` melalui `GET /auth/developer-roles` dan
+  `GET /auth/permissions`. Pembuatan/edit role memakai
+  `POST /auth/developer-roles`, `PATCH /auth/developer-roles/{role_id}`, dan
+  `PUT /auth/developer-roles/{role_id}/permissions`. Role `developer_admin`
+  dilindungi API dan tidak dapat dibuat ulang, dinonaktifkan, atau diubah
+  permission-nya. Penonaktifan akun/admin terakhir juga mengikuti perlindungan
+  API.
+  Reset password memakai field `password` pada
+  `PATCH /auth/developers/{user_id}` (minimal 12 karakter); API mencabut sesi
+  akun. Tidak ada endpoint reset khusus. Password hanya dimasukkan melalui
+  input tersamarkan dan tidak ditampilkan, dicatat, atau disimpan Desktop.
+- Menu Backup dan Pemulihan adalah halaman kesiapan, bukan pengelola backup
+  aktif. Pemeriksaan Universal API tidak menemukan model, router, permission,
+  atau endpoint database untuk membuat/mendaftar/mengunduh/memulihkan/
+  menghapus arsip backup maupun melihat status dan riwayat job.
+  `GET /health/ready` (alias `GET /health`) hanya melakukan pemeriksaan
+  kesiapan database dan bukan backup atau ekspor. Endpoint restore Tenant
+  dari recycle bin juga bukan pemulihan database. Desktop tidak mengakses
+  database atau menampilkan kontrol operasi yang belum didukung.
+  Universal API perlu menetapkan kontrak resmi untuk siklus hidup backup,
+  daftar dan metadata arsip, unduhan yang terotorisasi, job status/riwayat,
+  retensi serta penghapusan yang dapat dipulihkan/dilindungi, validasi
+  integritas, dan audit. Restore perlu validasi sumber, konfirmasi berlapis
+  di Desktop dan backend, kontrol konkurensi, serta strategi keselamatan
+  sebelum mengganti database. Backend juga perlu mendefinisikan permission
+  khusus, enkripsi/retensi, dan metode unduh yang tidak membocorkan kredensial
+  database. Nama endpoint dan permission belum ditentukan; Desktop tidak
+  mengarang kontraknya.
+- Menu Notifikasi Developer adalah halaman kesiapan, bukan feed. Pemeriksaan
+  Universal API tidak menemukan model atau endpoint notifikasi, webhook,
+  event delivery, status baca, maupun riwayat pengiriman.
+  `GET /auth/audit-logs` (`auth.audit.read`) tetap tersedia untuk audit
+  terpisah; responsnya berisi catatan audit dan bukan notifikasi, sehingga
+  Desktop tidak menggunakannya sebagai pengganti feed atau menyimpan
+  notifikasi lokal.
+  Backend perlu menetapkan kontrak untuk notifikasi yang ditujukan ke akun
+  Developer, metadata kategori/severity, Tenant dan waktu kejadian, pagination
+  dan filter/pencarian yang didukung, serta status baca bila diperlukan.
+  Jika event/webhook menjadi sumber notifikasi, backend juga perlu menyediakan
+  mekanisme delivery, status/riwayat dan retry, permission, serta audit.
+  Nama endpoint dan permission belum tersedia; Desktop tidak mengarang
+  kontraknya. Audit Log tidak diubah oleh menu ini.
 - Menu Tenant memuat `GET /tenants` memakai access token Developer dan
   permission `tenants.read`. Daftar memakai kontrak pagination API
   `items`, `total`, `limit`, `offset`, lalu mengisi tabel dengan data server.
@@ -118,6 +190,20 @@ URL Universal API dapat diubah pada halaman Konfigurasi atau langsung dari
 dialog Login Developer. Contoh untuk API lokal yang dijalankan pada port 8000:
 `http://127.0.0.1:8000`. URL digunakan pada login berikutnya. Gunakan HTTPS
 untuk API yang diakses melalui jaringan.
+
+## Konfigurasi lokal Desktop
+
+Menu Konfigurasi mengelola nama aplikasi, alamat Universal API, tema terang atau
+gelap, warna branding, dan ukuran jendela awal. Pengaturan tersebut disimpan
+secara lokal melalui `QSettings`; perubahan alamat API berlaku pada login
+berikutnya dan tidak mengubah konfigurasi pusat Universal API. **Uji Koneksi**
+memanggil `/health/live` tanpa autentikasi dan tidak membaca atau menampilkan
+token.
+
+Versi aplikasi ditampilkan sebagai `0.1.0-dev`. Token akses dan refresh tetap
+disimpan melalui keyring sistem operasi, bukan `QSettings`. Password tidak
+disimpan. Masa berlaku sesi ditentukan Universal API; Desktop tidak menyediakan
+pengaturan timeout sesi lokal.
 
 ## Menguji login
 

@@ -1,5 +1,8 @@
+import json
 import re
 import sys
+import time
+from datetime import date, datetime
 
 from api_client import ApiClient, ApiError
 from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
@@ -16,9 +19,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -33,6 +39,14 @@ DARK = "#2B0910"
 GOLD = "#D4AF37"
 BACKGROUND = "#F4F1EC"
 MUTED_GOLD = "#A16C19"
+APP_NAME = "SIMPATI Developer Desktop"
+APP_VERSION = "0.1.0-dev"
+APP_DEVELOPER = "SIMPATI"
+WINDOW_SIZES = {
+    "1024x680": (1024, 680),
+    "1280x780": (1280, 780),
+    "1440x900": (1440, 900),
+}
 
 
 def settings_store():
@@ -413,6 +427,78 @@ class ConnectionCheckWorker(QThread):
             self.checked.emit(True, "API: TERHUBUNG")
 
 
+class DashboardMonitoringWorker(QThread):
+    checked = Signal(object)
+
+    def __init__(self, api_client):
+        super().__init__()
+        self.api_client = api_client
+
+    def run(self):
+        started = time.perf_counter()
+        try:
+            self.api_client.check_connection()
+        except ApiError as exc:
+            connected = False
+            message = str(exc)
+        else:
+            connected = True
+            message = "API: TERHUBUNG"
+        response_ms = round((time.perf_counter() - started) * 1000, 2)
+        checked_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+
+        database_started = time.perf_counter()
+        try:
+            self.api_client.check_database_readiness()
+        except ApiError as exc:
+            if exc.status_code == 503:
+                database_status = "OFFLINE"
+                database_message = (
+                    "Universal API melaporkan readiness database gagal "
+                    "(HTTP 503)."
+                )
+            elif exc.status_code == 404:
+                database_status = "N/D"
+                database_message = (
+                    "Endpoint GET /health/ready tidak tersedia pada "
+                    "Universal API ini (HTTP 404)."
+                )
+            else:
+                database_status = "N/D"
+                database_message = (
+                    f"Status database tidak dapat dipastikan: {exc}"
+                )
+        else:
+            database_status = "ONLINE"
+            database_message = (
+                "GET /health/ready mengonfirmasi status ONLINE/CONNECTED."
+            )
+        database_response_ms = round(
+            (time.perf_counter() - database_started) * 1000, 2
+        )
+        database_checked_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        self.checked.emit(
+            {
+                "api": {
+                    "connected": connected,
+                    "message": message,
+                    "response_ms": response_ms,
+                    "checked_at": checked_at,
+                },
+                "database": {
+                    "status": database_status,
+                    "message": database_message,
+                    "response_ms": database_response_ms,
+                    "checked_at": database_checked_at,
+                },
+            }
+        )
+
+
 class DashboardLoadWorker(QThread):
     loaded = Signal(object)
 
@@ -426,48 +512,85 @@ class DashboardLoadWorker(QThread):
             "installations": None,
             "modules": None,
         }
+        timings = {}
         errors = {}
         tenants = None
 
+        started = time.perf_counter()
         try:
             tenants = self.api_client.list_tenants()
-            counts["tenants"] = len(tenants)
+            counts["tenants"] = sum(
+                tenant["status"] == "ACTIVE" for tenant in tenants
+            )
         except ApiError as exc:
             errors["tenants"] = str(exc)
+        finally:
+            timings["tenants"] = round(
+                (time.perf_counter() - started) * 1000, 2
+            )
 
         if tenants is None:
             errors["installations"] = (
-                "Jumlah instalasi tidak dapat dihitung karena daftar Tenant "
-                "gagal dimuat."
+                "Jumlah instalasi aktif tidak dapat dihitung karena daftar "
+                "Tenant gagal dimuat."
             )
         else:
+            started = time.perf_counter()
             try:
                 counts["installations"] = sum(
-                    self.api_client.count_tenant_installations(
-                        tenant["id"]
+                    sum(
+                        installation["status"] == "ACTIVE"
+                        for installation in
+                        self.api_client.list_tenant_installations(
+                            tenant["id"]
+                        )
                     )
                     for tenant in tenants
                 )
             except ApiError as exc:
                 errors["installations"] = str(exc)
+            finally:
+                timings["installations"] = round(
+                    (time.perf_counter() - started) * 1000, 2
+                )
 
+        started = time.perf_counter()
         try:
-            counts["modules"] = len(self.api_client.list_modules())
+            counts["modules"] = sum(
+                module["is_active"]
+                for module in self.api_client.list_modules()
+            )
         except ApiError as exc:
             errors["modules"] = str(exc)
+        finally:
+            timings["modules"] = round(
+                (time.perf_counter() - started) * 1000, 2
+            )
 
+        started = time.perf_counter()
         try:
             activities = self.api_client.list_recent_audit_logs()
         except ApiError as exc:
             activities = []
             errors["activity"] = str(exc)
+        finally:
+            timings["activity"] = round(
+                (time.perf_counter() - started) * 1000, 2
+            )
 
         self.loaded.emit(
-            {"counts": counts, "errors": errors, "activities": activities}
+            {
+                "counts": counts,
+                "errors": errors,
+                "activities": activities,
+                "timings_ms": timings,
+            }
         )
 
 
 class DashboardPage(QWidget):
+    health_check_requested = Signal()
+
     def __init__(self, api_client=None):
         super().__init__()
         self.api_client = api_client
@@ -479,9 +602,9 @@ class DashboardPage(QWidget):
         heading = QHBoxLayout()
         heading.addWidget(make_title("Dashboard"))
         heading.addStretch()
-        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button = QPushButton("Periksa Ulang")
         self.refresh_button.setObjectName("secondaryButton")
-        self.refresh_button.clicked.connect(self.load_dashboard)
+        self.refresh_button.clicked.connect(self.refresh_dashboard)
         heading.addWidget(self.refresh_button)
         developer_tag = QLabel("DEVELOPER")
         developer_tag.setObjectName("roleTag")
@@ -501,7 +624,7 @@ class DashboardPage(QWidget):
         self.stat_values = {}
         for index, (key, title, detail) in enumerate(
             (
-                ("tenants", "TOTAL TENANT", "Tenant terdaftar"),
+                ("tenants", "TENANT AKTIF", "Status ACTIVE dari Universal API"),
                 (
                     "active_licenses",
                     "LISENSI AKTIF",
@@ -517,8 +640,16 @@ class DashboardPage(QWidget):
                     "EXPIRED",
                     "Belum tersedia melalui Universal API",
                 ),
-                ("installations", "INSTALASI", "Perangkat terdaftar"),
-                ("modules", "MODUL SISTEM", "Katalog modul"),
+                (
+                    "installations",
+                    "INSTALASI AKTIF",
+                    "Status ACTIVE dari Universal API",
+                ),
+                (
+                    "modules",
+                    "MODUL TERSEDIA",
+                    "Modul katalog berstatus aktif",
+                ),
             )
         ):
             card = QFrame()
@@ -548,16 +679,37 @@ class DashboardPage(QWidget):
         connection_layout = QVBoxLayout(connection_card)
         connection_layout.setContentsMargins(18, 16, 18, 16)
         connection_layout.setSpacing(9)
-        connection_layout.addWidget(QLabel("STATUS KONEKSI"))
-        self.api_status = make_status_label("API: BELUM DIPERIKSA")
-        connection_layout.addWidget(self.api_status)
-        connection_layout.addWidget(
-            make_status_label("DATABASE: DIKELOLA MELALUI UNIVERSAL API")
+        connection_layout.addWidget(QLabel("MONITORING UNIVERSAL API"))
+        self.api_status = make_status_label(
+            "UNIVERSAL API: BELUM DIPERIKSA"
         )
+        connection_layout.addWidget(self.api_status)
+        self.api_response_time = QLabel("Waktu respons: N/D")
+        self.api_response_time.setObjectName("subtleText")
+        connection_layout.addWidget(self.api_response_time)
+        self.last_health_check = QLabel(
+            "Pemeriksaan terakhir: belum diperiksa"
+        )
+        self.last_health_check.setObjectName("subtleText")
+        connection_layout.addWidget(self.last_health_check)
+        self.database_status = make_status_label("DATABASE: N/D")
+        self.database_status.setToolTip(
+            "Status database akan ditampilkan hanya dari pemeriksaan resmi "
+            "GET /health/ready."
+        )
+        connection_layout.addWidget(self.database_status)
+        self.database_response_time = QLabel("Waktu respons database: N/D")
+        self.database_response_time.setObjectName("subtleText")
+        connection_layout.addWidget(self.database_response_time)
+        self.last_database_check = QLabel(
+            "Pemeriksaan database terakhir: belum diperiksa"
+        )
+        self.last_database_check.setObjectName("subtleText")
+        connection_layout.addWidget(self.last_database_check)
         connection_note = QLabel(
-            "Aplikasi tidak terhubung langsung ke database. "
-            "Operasi data dan License Manager tetap menjadi tanggung jawab "
-            "backend Universal API."
+            "GET /health/live memeriksa layanan API; GET /health/ready "
+            "memeriksa koneksi database. Status database tidak disimpulkan "
+            "dari status liveness API."
         )
         connection_note.setObjectName("subtleText")
         connection_note.setWordWrap(True)
@@ -581,12 +733,26 @@ class DashboardPage(QWidget):
         layout.addWidget(self.data_status)
         layout.addStretch()
 
+    def refresh_dashboard(self):
+        self.load_dashboard()
+        self.health_check_requested.emit()
+
     def load_dashboard(self):
         if self.api_client is None:
             self.data_status.setText(
                 "DATA DASHBOARD: UNIVERSAL API BELUM TERHUBUNG"
             )
             self.data_status.setStyleSheet("color:#A32323;")
+            self.show_api_health(
+                False,
+                "Alamat Universal API belum dikonfigurasi.",
+                None,
+                None,
+                "N/D",
+                "Universal API belum dikonfigurasi.",
+                None,
+                None,
+            )
             return
         if self.load_worker and self.load_worker.isRunning():
             return
@@ -598,21 +764,117 @@ class DashboardPage(QWidget):
         self.load_worker.loaded.connect(self.show_dashboard_data)
         self.load_worker.start()
 
+    def show_api_health(
+        self,
+        connected,
+        message,
+        response_ms=None,
+        checked_at=None,
+        database_status="N/D",
+        database_message="Status database belum diperiksa.",
+        database_response_ms=None,
+        database_checked_at=None,
+    ):
+        if connected:
+            status = "UNIVERSAL API: ONLINE"
+            color = MUTED_GOLD
+        elif message == "Alamat Universal API belum dikonfigurasi.":
+            status = "UNIVERSAL API: BELUM DIKONFIGURASI"
+            color = "#A32323"
+        else:
+            status = "UNIVERSAL API: OFFLINE"
+            color = "#A32323"
+        self.api_status.setText(status)
+        self.api_status.setToolTip(message)
+        self.api_status.setStyleSheet(f"color:{color};")
+        if isinstance(response_ms, (int, float)):
+            self.api_response_time.setText(
+                f"Waktu respons: {response_ms:.2f} ms"
+            )
+        else:
+            self.api_response_time.setText("Waktu respons: N/D")
+        self.last_health_check.setText(
+            "Pemeriksaan terakhir: "
+            + (checked_at if isinstance(checked_at, str) else "belum diperiksa")
+        )
+        self.show_database_readiness(
+            database_status,
+            database_message,
+            database_response_ms,
+            database_checked_at,
+        )
+
+    def show_database_readiness(
+        self, status, message, response_ms=None, checked_at=None
+    ):
+        if status == "ONLINE":
+            self.database_status.setText("DATABASE: ONLINE")
+            self.database_status.setStyleSheet(f"color:{MUTED_GOLD};")
+        elif status == "OFFLINE":
+            self.database_status.setText("DATABASE: OFFLINE")
+            self.database_status.setStyleSheet("color:#A32323;")
+        else:
+            self.database_status.setText("DATABASE: N/D")
+            self.database_status.setStyleSheet("")
+        self.database_status.setToolTip(message)
+        if isinstance(response_ms, (int, float)):
+            self.database_response_time.setText(
+                f"Waktu respons database: {response_ms:.2f} ms"
+            )
+        else:
+            self.database_response_time.setText(
+                "Waktu respons database: N/D"
+            )
+        self.last_database_check.setText(
+            "Pemeriksaan database terakhir: "
+            + (
+                checked_at
+                if isinstance(checked_at, str)
+                else "belum diperiksa"
+            )
+        )
+
+    def show_api_checking(self):
+        self.api_status.setText("UNIVERSAL API: MEMERIKSA...")
+        self.api_status.setToolTip("Endpoint GET /health/live sedang diperiksa.")
+        self.api_status.setStyleSheet("")
+        self.api_response_time.setText("Waktu respons: sedang diperiksa")
+        self.last_health_check.setText("Pemeriksaan terakhir: sedang berlangsung")
+        self.database_status.setText("DATABASE: MEMERIKSA...")
+        self.database_status.setToolTip(
+            "Endpoint GET /health/ready sedang diperiksa."
+        )
+        self.database_status.setStyleSheet("")
+        self.database_response_time.setText(
+            "Waktu respons database: sedang diperiksa"
+        )
+        self.last_database_check.setText(
+            "Pemeriksaan database terakhir: sedang berlangsung"
+        )
+
     def show_dashboard_data(self, snapshot):
         counts = snapshot["counts"]
         errors = snapshot["errors"]
         metric_keys = {
-            "TOTAL TENANT": "tenants",
-            "INSTALASI": "installations",
-            "MODUL SISTEM": "modules",
+            "TENANT AKTIF": "tenants",
+            "INSTALASI AKTIF": "installations",
+            "MODUL TERSEDIA": "modules",
         }
+        timings = snapshot.get("timings_ms", {})
         for title, metric_key in metric_keys.items():
             value = counts[metric_key]
             error = errors.get(metric_key)
             self.stat_values[title].setText(
                 "Gagal" if error else str(value)
             )
-            self.stat_values[title].setToolTip(error or "Data dari Universal API.")
+            response_ms = timings.get(metric_key)
+            detail = error or "Data aktual dari Universal API."
+            detail += (
+                f"\nWaktu respons pemeriksaan: {response_ms:.2f} ms"
+                if isinstance(response_ms, (int, float))
+                else "\nWaktu respons pemeriksaan: N/D"
+            )
+            self.stat_values[title].setToolTip(detail)
 
         activities = snapshot["activities"]
         if "activity" in errors:
@@ -634,6 +896,15 @@ class DashboardPage(QWidget):
                     for log in activities
                 )
             )
+        activity_response_ms = timings.get("activity")
+        self.activity_label.setToolTip(
+            errors.get("activity", "Aktivitas aktual dari Universal API.")
+            + (
+                f"\nWaktu respons pemeriksaan: {activity_response_ms:.2f} ms"
+                if isinstance(activity_response_ms, (int, float))
+                else "\nWaktu respons pemeriksaan: N/D"
+            )
+        )
 
         if errors:
             messages = [
@@ -1159,6 +1430,1490 @@ class DataPage(QWidget):
             item = self.table.item(row, column)
             details.append(f"{header}: {item.text() if item else '—'}")
         QMessageBox.information(self, "Detail " + self.title, "\n".join(details))
+
+
+class AuditLogLoadWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, limit, offset):
+        super().__init__()
+        self.api_client = api_client
+        self.limit = limit
+        self.offset = offset
+
+    def run(self):
+        try:
+            page = self.api_client.list_audit_logs(
+                limit=self.limit, offset=self.offset
+            )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(page)
+
+
+class AuditLogPage(DataPage):
+    PAGE_SIZE = 50
+
+    def __init__(self, api_client):
+        self.api_client = api_client
+        self.offset = 0
+        self.logs = []
+        self.logs_by_id = {}
+        self.request_pending = False
+        self.worker = None
+        super().__init__(
+            "Audit Log",
+            "Riwayat aktivitas dan perubahan yang tercatat di Universal API.",
+            ["NO.", "WAKTU", "AKTOR", "AKTIVITAS", "OBJEK", "HASIL"],
+            filter_column=3,
+            filter_values=(),
+        )
+        self.search.setPlaceholderText("Cari pada halaman yang dimuat...")
+        self.actor_filter = QComboBox()
+        self.actor_filter.addItem("Semua aktor", None)
+        self.actor_filter.currentTextChanged.connect(self.filter_table)
+        self.toolbar.addWidget(self.actor_filter)
+        self.date_from = QLineEdit()
+        self.date_from.setPlaceholderText("Dari YYYY-MM-DD")
+        self.date_from.setMaximumWidth(145)
+        self.date_from.textChanged.connect(self.filter_table)
+        self.toolbar.addWidget(self.date_from)
+        self.date_to = QLineEdit()
+        self.date_to.setPlaceholderText("Sampai YYYY-MM-DD")
+        self.date_to.setMaximumWidth(145)
+        self.date_to.textChanged.connect(self.filter_table)
+        self.toolbar.addWidget(self.date_to)
+
+        self.filter_limitation = QLabel(
+            "API mendukung pagination, tetapi belum mendukung pencarian atau "
+            "filter periode/aktor/aktivitas di server. Filter di sini hanya "
+            "berlaku pada halaman yang sedang dimuat."
+        )
+        self.filter_limitation.setObjectName("subtleText")
+        self.filter_limitation.setWordWrap(True)
+        self.layout().insertWidget(3, self.filter_limitation)
+        self.filter_error = QLabel()
+        self.filter_error.setStyleSheet("color:#A32323;")
+        self.filter_error.setVisible(False)
+        self.layout().insertWidget(4, self.filter_error)
+
+        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.toolbar.addWidget(self.refresh_button)
+        self.detail_button = QPushButton("Lihat Detail")
+        self.detail_button.setObjectName("secondaryButton")
+        self.detail_button.setEnabled(False)
+        self.detail_button.clicked.connect(self.show_selected_details)
+        self.toolbar.addWidget(self.detail_button)
+        self.table.itemSelectionChanged.connect(self._update_detail_button)
+
+        self.previous_button = QPushButton("Sebelumnya")
+        self.previous_button.setObjectName("secondaryButton")
+        self.previous_button.clicked.connect(self.previous_page)
+        self.next_button = QPushButton("Berikutnya")
+        self.next_button.setObjectName("secondaryButton")
+        self.next_button.clicked.connect(self.next_page)
+        self.page_label = QLabel("Halaman belum dimuat")
+        self.page_label.setObjectName("subtleText")
+        pagination = QHBoxLayout()
+        pagination.addWidget(self.previous_button)
+        pagination.addWidget(self.page_label)
+        pagination.addStretch()
+        pagination.addWidget(self.next_button)
+        self.layout().insertLayout(self.layout().count() - 1, pagination)
+        self.empty_label.setText(
+            "Buka menu ini untuk memuat riwayat audit dari Universal API."
+        )
+        self._update_pagination_controls()
+
+    def load_page(self, offset=0):
+        if self.request_pending:
+            return
+        if self.api_client is None:
+            self._show_load_error("Client Universal API tidak tersedia.")
+            return
+        if type(offset) is not int or offset < 0:
+            self._show_load_error("Offset halaman audit tidak valid.")
+            return
+        self.offset = offset
+        self.request_pending = True
+        self.logs = []
+        self.logs_by_id = {}
+        self.table.setRowCount(0)
+        self.empty_label.setText("Memuat riwayat audit...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText("AUDIT LOG: MEMUAT DARI UNIVERSAL API...")
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self.refresh_button.setEnabled(False)
+        self.filter_limitation.setEnabled(False)
+        self._update_detail_button()
+        self._update_pagination_controls()
+        self.worker = AuditLogLoadWorker(
+            self.api_client, self.PAGE_SIZE, self.offset
+        )
+        self.worker.loaded.connect(self._show_page)
+        self.worker.failed.connect(self._show_load_error)
+        self.worker.finished.connect(self._load_finished)
+        self.worker.start()
+
+    def refresh(self):
+        self.load_page(0)
+
+    def previous_page(self):
+        if self.offset > 0:
+            self.load_page(max(0, self.offset - self.PAGE_SIZE))
+
+    def next_page(self):
+        if len(self.logs) == self.PAGE_SIZE:
+            self.load_page(self.offset + self.PAGE_SIZE)
+
+    def _show_page(self, page):
+        self.logs = page["items"]
+        self.logs_by_id = {log["id"]: log for log in self.logs}
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self.logs))
+            for index, log in enumerate(self.logs):
+                values = (
+                    self.offset + index + 1,
+                    log["created_at"],
+                    self._actor_label(log),
+                    log["action"],
+                    self._entity_label(log),
+                    self._summary(log.get("details")),
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column == 0:
+                        item.setData(Qt.ItemDataRole.UserRole, log["id"])
+                    self.table.setItem(index, column, item)
+        finally:
+            self.table.blockSignals(False)
+        self.refresh_filter_choices()
+        self._refresh_actor_choices()
+        self.filter_error.clear()
+        self.filter_error.setVisible(False)
+        self.data_status.setText(
+            f"AUDIT LOG: {len(self.logs)} DIMUAT (OFFSET {self.offset}); "
+            "TOTAL TIDAK DISEDIAKAN API"
+        )
+        self.data_status.setToolTip(
+            "Universal API tidak mengembalikan total catatan audit."
+        )
+        self.data_status.setStyleSheet("")
+        self.page_label.setText(
+            f"Halaman {self.offset // self.PAGE_SIZE + 1} — "
+            f"{len(self.logs)} catatan; total tidak tersedia"
+        )
+        self.filter_table()
+        self._update_detail_button()
+        self._update_pagination_controls()
+
+    def _show_load_error(self, message):
+        self.data_status.setText(f"AUDIT LOG: GAGAL DIMUAT — {message}")
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+        if self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Riwayat audit tidak dapat dimuat dari Universal API.\n"
+                + message
+            )
+            self.empty_label.setVisible(True)
+
+    def _load_finished(self):
+        self.request_pending = False
+        self.refresh_button.setEnabled(True)
+        self.filter_limitation.setEnabled(True)
+        self._update_pagination_controls()
+
+    def _update_pagination_controls(self):
+        self.previous_button.setEnabled(
+            not self.request_pending and self.offset > 0
+        )
+        self.next_button.setEnabled(
+            not self.request_pending and len(self.logs) == self.PAGE_SIZE
+        )
+
+    def _update_detail_button(self):
+        row = self.table.currentRow()
+        self.detail_button.setEnabled(
+            row >= 0 and not self.request_pending
+        )
+
+    def _selected_log(self):
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        log_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self.logs_by_id.get(log_id)
+
+    def show_selected_details(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.show_details(row, 0)
+
+    def show_details(self, row, column):
+        self.table.setCurrentCell(row, column)
+        log = self._selected_log()
+        if log is None:
+            self._show_load_error("Catatan audit yang dipilih tidak valid.")
+            return
+        details = log.get("details")
+        rendered_details = (
+            json.dumps(details, ensure_ascii=False, indent=2, sort_keys=True)
+            if details is not None
+            else "Tidak tersedia"
+        )
+        lines = [
+            f"ID log: {log['id']}",
+            f"Waktu: {log['created_at']}",
+            f"Tenant ID: {log.get('tenant_id') or '—'}",
+            f"Aktor: {self._actor_label(log)}",
+            f"Aktivitas: {log['action']}",
+            f"Objek: {self._entity_label(log)}",
+            "Hasil/informasi aktivitas:",
+            rendered_details,
+        ]
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Detail Audit Log")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("\n".join(lines))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
+
+    def filter_table(self, *_):
+        keyword = self.search.text().casefold().strip()
+        selected_action = (
+            self.status_filter.currentText()
+            if self.status_filter is not None
+            else "Semua"
+        )
+        selected_actor = self.actor_filter.currentData()
+        start_text = self.date_from.text().strip()
+        end_text = self.date_to.text().strip()
+        filter_message = ""
+        try:
+            start_date = date.fromisoformat(start_text) if start_text else None
+            end_date = date.fromisoformat(end_text) if end_text else None
+            if start_date and end_date and start_date > end_date:
+                filter_message = "Tanggal awal harus sebelum tanggal akhir."
+        except ValueError:
+            start_date = None
+            end_date = None
+            filter_message = "Gunakan format tanggal YYYY-MM-DD."
+        self.filter_error.setText(filter_message)
+        self.filter_error.setVisible(bool(filter_message))
+
+        visible_count = 0
+        for row, log in enumerate(self.logs):
+            values = (
+                self.table.item(row, column).text().casefold()
+                if self.table.item(row, column)
+                else ""
+                for column in range(self.table.columnCount())
+            )
+            matches_keyword = not keyword or any(
+                keyword in value for value in values
+            )
+            matches_action = (
+                selected_action == "Semua"
+                or log["action"].casefold() == selected_action.casefold()
+            )
+            matches_actor = (
+                selected_actor is None
+                or self._actor_value(log) == selected_actor
+            )
+            try:
+                log_date = datetime.fromisoformat(
+                    log["created_at"].replace("Z", "+00:00")
+                ).date()
+            except ValueError:
+                log_date = None
+            matches_period = (
+                (
+                    start_date is None
+                    or (
+                        log_date is not None
+                        and log_date >= start_date
+                    )
+                )
+                and (
+                    end_date is None
+                    or (log_date is not None and log_date <= end_date)
+                )
+            )
+            visible = (
+                not filter_message
+                and matches_keyword
+                and matches_action
+                and matches_actor
+                and matches_period
+            )
+            self.table.setRowHidden(row, not visible)
+            visible_count += int(visible)
+        self.update_empty_state(visible_count)
+
+    def refresh_filter_choices(self, *_):
+        if self.status_filter is None:
+            return
+        selected = self.status_filter.currentText()
+        actions = sorted({log["action"] for log in self.logs}, key=str.casefold)
+        self.status_filter.blockSignals(True)
+        self.status_filter.clear()
+        self.status_filter.addItems(["Semua"] + actions)
+        if selected in actions:
+            self.status_filter.setCurrentText(selected)
+        self.status_filter.blockSignals(False)
+
+    def _refresh_actor_choices(self):
+        selected = self.actor_filter.currentData()
+        actors = sorted(
+            {self._actor_value(log) for log in self.logs},
+            key=str.casefold,
+        )
+        self.actor_filter.blockSignals(True)
+        self.actor_filter.clear()
+        self.actor_filter.addItem("Semua aktor", None)
+        for actor in actors:
+            self.actor_filter.addItem(actor, actor)
+        if selected in actors:
+            self.actor_filter.setCurrentIndex(
+                self.actor_filter.findData(selected)
+            )
+        self.actor_filter.blockSignals(False)
+
+    @staticmethod
+    def _actor_value(log):
+        actor_id = log.get("actor_id")
+        return f"{log['actor_type']} #{actor_id if actor_id is not None else '—'}"
+
+    @classmethod
+    def _actor_label(cls, log):
+        return cls._actor_value(log)
+
+    @staticmethod
+    def _entity_label(log):
+        entity_id = log.get("entity_id")
+        return (
+            f"{log['entity']} #{entity_id}"
+            if entity_id is not None
+            else log["entity"]
+        )
+
+    @staticmethod
+    def _summary(details):
+        if not details:
+            return "—"
+        value = details.get("result", details.get("summary", details))
+        if isinstance(value, str):
+            summary = value
+        else:
+            summary = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, default=str
+            )
+        return summary if len(summary) <= 160 else summary[:157] + "..."
+
+    def update_empty_state(self, visible_count=None):
+        if self.table.rowCount() == 0:
+            if self.request_pending:
+                message = "Memuat riwayat audit..."
+            elif (
+                hasattr(self, "data_status")
+                and self.data_status.text().startswith("AUDIT LOG: GAGAL")
+            ):
+                message = "Riwayat audit belum dapat dimuat."
+            elif self.offset > 0:
+                message = (
+                    "Tidak ada catatan pada offset ini. API tidak "
+                    "menyediakan jumlah total untuk membatasi pagination."
+                )
+            elif self.logs:
+                message = "Tidak ada catatan audit yang cocok dengan filter."
+            else:
+                message = "Belum ada catatan audit pada halaman ini."
+        elif visible_count == 0:
+            message = "Tidak ada catatan audit yang cocok dengan filter."
+        else:
+            message = ""
+        self.empty_label.setText(message)
+        self.empty_label.setVisible(bool(message))
+
+    def wait_for_load(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.wait()
+
+
+class DeveloperAccountDialog(QDialog):
+    def __init__(self, account=None, roles=None, parent=None):
+        super().__init__(parent)
+        self.account = account
+        self.is_create = account is None
+        self.setWindowTitle(
+            "Tambah Akun Developer"
+            if self.is_create
+            else "Edit Akun Developer"
+        )
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.username = QLineEdit(
+            "" if self.is_create else account["username"]
+        )
+        self.username.setReadOnly(not self.is_create)
+        form.addRow("Username", self.username)
+        self.full_name = QLineEdit(
+            "" if self.is_create else account["full_name"]
+        )
+        self.full_name.setMaxLength(200)
+        form.addRow("Nama lengkap", self.full_name)
+        if self.is_create:
+            self.password = QLineEdit()
+            self.password.setEchoMode(QLineEdit.EchoMode.Password)
+            self.password.setMaxLength(256)
+            self.confirm_password = QLineEdit()
+            self.confirm_password.setEchoMode(QLineEdit.EchoMode.Password)
+            self.confirm_password.setMaxLength(256)
+            form.addRow("Password awal", self.password)
+            form.addRow("Konfirmasi password", self.confirm_password)
+        layout.addLayout(form)
+        self.role_list = None
+        self.role_note = None
+        if self.is_create:
+            if roles is None:
+                self.role_note = QLabel(
+                    "Katalog role tidak tersedia. Akun dibuat tanpa role "
+                    "dan tidak menerima hak akses otomatis."
+                )
+                self.role_note.setObjectName("subtleText")
+                self.role_note.setWordWrap(True)
+                layout.addWidget(self.role_note)
+            else:
+                self.role_list = QListWidget()
+                for role in roles:
+                    if not role["is_active"]:
+                        continue
+                    item = QListWidgetItem(
+                        f"{role['code']} — {role['name']}"
+                    )
+                    item.setData(Qt.ItemDataRole.UserRole, role["code"])
+                    item.setFlags(
+                        item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    item.setCheckState(Qt.CheckState.Unchecked)
+                    self.role_list.addItem(item)
+                layout.addWidget(QLabel("Role yang diberikan (opsional)"))
+                layout.addWidget(self.role_list)
+                self.role_note = QLabel(
+                    "Tidak ada role yang dipilih secara otomatis. "
+                    "developer_admin memberikan hak istimewa tinggi."
+                )
+                self.role_note.setObjectName("subtleText")
+                self.role_note.setWordWrap(True)
+                layout.addWidget(self.role_note)
+        self.validation_message = QLabel(
+            "Password minimal 12 karakter dan tidak akan ditampilkan."
+            if self.is_create
+            else "Username tidak dapat diubah melalui Universal API."
+        )
+        self.validation_message.setObjectName("subtleText")
+        self.validation_message.setWordWrap(True)
+        layout.addWidget(self.validation_message)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.submit_form)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def submit_form(self):
+        if not self.full_name.text().strip():
+            self.validation_message.setText("Nama lengkap wajib diisi.")
+            return False
+        if self.is_create:
+            if not self.username.text().strip():
+                self.validation_message.setText("Username wajib diisi.")
+                return False
+            if not 12 <= len(self.password.text()) <= 256:
+                self.validation_message.setText(
+                    "Password harus terdiri dari 12–256 karakter."
+                )
+                return False
+            if self.password.text() != self.confirm_password.text():
+                self.validation_message.setText(
+                    "Konfirmasi password tidak cocok."
+                )
+                return False
+        self.accept()
+        return True
+
+    def values(self):
+        values = {"full_name": self.full_name.text().strip()}
+        if self.is_create:
+            values.update(
+                {
+                    "username": self.username.text().strip(),
+                    "password": self.password.text(),
+                    "role_codes": self.selected_role_codes(),
+                }
+            )
+        return values
+
+    def selected_role_codes(self):
+        if self.role_list is None:
+            return []
+        return [
+            self.role_list.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self.role_list.count())
+            if self.role_list.item(index).checkState()
+            == Qt.CheckState.Checked
+        ]
+
+    def clear_sensitive_inputs(self):
+        if self.is_create:
+            self.password.clear()
+            self.confirm_password.clear()
+
+
+class DeveloperPasswordDialog(QDialog):
+    def __init__(self, username, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Reset Password Developer")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"Akun: {username}"))
+        form = QFormLayout()
+        self.password = QLineEdit()
+        self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setMaxLength(256)
+        self.confirm_password = QLineEdit()
+        self.confirm_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.confirm_password.setMaxLength(256)
+        form.addRow("Password baru", self.password)
+        form.addRow("Konfirmasi password", self.confirm_password)
+        layout.addLayout(form)
+        self.validation_message = QLabel(
+            "Password minimal 12 karakter. Universal API akan mencabut "
+            "sesi aktif akun setelah reset."
+        )
+        self.validation_message.setObjectName("subtleText")
+        self.validation_message.setWordWrap(True)
+        layout.addWidget(self.validation_message)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.submit_form)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def submit_form(self):
+        if not 12 <= len(self.password.text()) <= 256:
+            self.validation_message.setText(
+                "Password harus terdiri dari 12–256 karakter."
+            )
+            return False
+        if self.password.text() != self.confirm_password.text():
+            self.validation_message.setText(
+                "Konfirmasi password tidak cocok."
+            )
+            return False
+        self.accept()
+        return True
+
+    def value(self):
+        return self.password.text()
+
+    def clear_passwords(self):
+        self.password.clear()
+        self.confirm_password.clear()
+
+
+class DeveloperSelectionDialog(QDialog):
+    def __init__(
+        self,
+        title,
+        choices,
+        selected_codes=(),
+        note="Pilihan akan diterapkan persis seperti yang dicentang.",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(500)
+        layout = QVBoxLayout(self)
+        self.items = QListWidget()
+        selected_codes = set(selected_codes)
+        for choice in choices:
+            code = choice["code"]
+            description = choice.get("name", "")
+            module = choice.get("module")
+            label = f"{code} — {description}" if description else code
+            if module:
+                label += f" ({module})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, code)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if code in selected_codes
+                else Qt.CheckState.Unchecked
+            )
+            self.items.addItem(item)
+        layout.addWidget(self.items)
+        self.note = QLabel(note)
+        self.note.setObjectName("subtleText")
+        self.note.setWordWrap(True)
+        layout.addWidget(self.note)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_codes(self):
+        return [
+            self.items.item(index).data(Qt.ItemDataRole.UserRole)
+            for index in range(self.items.count())
+            if self.items.item(index).checkState() == Qt.CheckState.Checked
+        ]
+
+
+class DeveloperAccountsLoadWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, limit, offset):
+        super().__init__()
+        self.api_client = api_client
+        self.limit = limit
+        self.offset = offset
+
+    def run(self):
+        try:
+            accounts = self.api_client.list_developer_accounts(
+                limit=self.limit, offset=self.offset
+            )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+            return
+        roles = None
+        permissions = None
+        role_error = None
+        permission_error = None
+        try:
+            roles = self.api_client.list_developer_roles()
+        except ApiError as exc:
+            role_error = str(exc)
+        try:
+            permissions = self.api_client.list_developer_permissions()
+        except ApiError as exc:
+            permission_error = str(exc)
+        self.loaded.emit(
+            {
+                "accounts": accounts,
+                "roles": roles,
+                "permissions": permissions,
+                "role_error": role_error,
+                "permission_error": permission_error,
+            }
+        )
+
+
+class DeveloperMutationWorker(QThread):
+    saved = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, operation, **values):
+        super().__init__()
+        self.api_client = api_client
+        self.operation = operation
+        self.values = values
+
+    def run(self):
+        try:
+            if self.operation == "create":
+                result = self.api_client.create_developer_account(
+                    self.values["username"],
+                    self.values["password"],
+                    self.values["full_name"],
+                    self.values["role_codes"],
+                )
+            elif self.operation == "update":
+                result = self.api_client.update_developer_account(
+                    self.values["user_id"], self.values["full_name"]
+                )
+            elif self.operation == "status":
+                result = self.api_client.set_developer_account_active(
+                    self.values["user_id"], self.values["is_active"]
+                )
+            elif self.operation == "password":
+                result = self.api_client.reset_developer_password(
+                    self.values["user_id"], self.values["password"]
+                )
+            else:
+                result = self.api_client.assign_developer_roles(
+                    self.values["user_id"], self.values["role_codes"]
+                )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.saved.emit(self.operation, result)
+
+
+class DeveloperRoleMutationWorker(QThread):
+    saved = Signal(object, object, object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, operation, **values):
+        super().__init__()
+        self.api_client = api_client
+        self.operation = operation
+        self.values = values
+
+    def run(self):
+        try:
+            if self.operation == "create":
+                result = self.api_client.create_developer_role(
+                    self.values["code"],
+                    self.values["name"],
+                    self.values["description"],
+                    self.values["permission_codes"],
+                )
+            elif self.operation == "update":
+                result = self.api_client.update_developer_role(
+                    self.values["role_id"],
+                    self.values["name"],
+                    self.values["description"],
+                    self.values["is_active"],
+                )
+            else:
+                result = self.api_client.set_developer_role_permissions(
+                    self.values["role_id"],
+                    self.values["permission_codes"],
+                )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.saved.emit(self.operation, result, self.values)
+
+
+class DeveloperRoleManagerDialog(QDialog):
+    def __init__(self, api_client, roles, permissions, parent=None):
+        super().__init__(parent)
+        self.api_client = api_client
+        self.roles = list(roles)
+        self.permissions = list(permissions)
+        self.role_by_id = {role["id"]: role for role in self.roles}
+        self.worker = None
+        self.mutation_pending = False
+        self.did_change = False
+        self.setWindowTitle("Role dan Permission Developer")
+        self.resize(800, 520)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Hak akses hanya berubah setelah dipilih dan disimpan. Role "
+            "developer_admin dikelola sistem dan tidak dapat dinonaktifkan "
+            "atau diubah permission-nya."
+        )
+        note.setObjectName("subtleText")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["ID", "KODE", "NAMA", "STATUS", "PERMISSION"]
+        )
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.table.itemSelectionChanged.connect(self._update_actions)
+        layout.addWidget(self.table, 1)
+        actions = QHBoxLayout()
+        self.create_button = QPushButton("Tambah Role")
+        self.create_button.clicked.connect(self.open_create)
+        self.edit_button = QPushButton("Edit Role")
+        self.edit_button.setObjectName("secondaryButton")
+        self.edit_button.clicked.connect(self.open_edit)
+        self.permissions_button = QPushButton("Atur Permission")
+        self.permissions_button.setObjectName("secondaryButton")
+        self.permissions_button.clicked.connect(self.open_permissions)
+        actions.addWidget(self.create_button)
+        actions.addWidget(self.edit_button)
+        actions.addWidget(self.permissions_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+        self.status = QLabel("Role dan permission dimuat dari Universal API.")
+        self.status.setObjectName("subtleText")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self._show_roles()
+
+    def _show_roles(self, selected_id=None):
+        self.role_by_id = {role["id"]: role for role in self.roles}
+        self.table.setRowCount(len(self.roles))
+        selected_row = None
+        for row, role in enumerate(self.roles):
+            values = (
+                role["id"],
+                role["code"],
+                role["name"],
+                "ACTIVE" if role["is_active"] else "INACTIVE",
+                ", ".join(role["permissions"]) or "—",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, role["id"])
+                self.table.setItem(row, column, item)
+            if role["id"] == selected_id:
+                selected_row = row
+        if selected_row is not None:
+            self.table.selectRow(selected_row)
+        self._update_actions()
+
+    def _selected_role(self):
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        role_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self.role_by_id.get(role_id)
+
+    def _update_actions(self):
+        role = self._selected_role()
+        busy = self.mutation_pending
+        self.create_button.setEnabled(not busy)
+        self.edit_button.setEnabled(not busy and role is not None)
+        self.permissions_button.setEnabled(
+            not busy
+            and role is not None
+            and role["code"] != "developer_admin"
+        )
+
+    def open_create(self):
+        dialog = FormDialog(
+            "Tambah Role Developer",
+            [("KODE ROLE", True), ("NAMA ROLE", True), ("DESKRIPSI", False)],
+            parent=self,
+            submit_handler=lambda form: form.accept(),
+        )
+        dialog.inputs["KODE ROLE"].setMaxLength(50)
+        dialog.inputs["NAMA ROLE"].setMaxLength(100)
+        dialog.inputs["DESKRIPSI"].setMaxLength(2000)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        self._start_mutation(
+            "create",
+            code=values["KODE ROLE"],
+            name=values["NAMA ROLE"],
+            description=values["DESKRIPSI"] or None,
+            permission_codes=[],
+        )
+
+    def open_edit(self):
+        role = self._selected_role()
+        if role is None:
+            return
+        dialog = FormDialog(
+            "Edit Role Developer",
+            [
+                ("NAMA ROLE", True),
+                ("DESKRIPSI", False),
+                ("STATUS", True, ("ACTIVE", "INACTIVE")),
+            ],
+            {
+                "NAMA ROLE": role["name"],
+                "DESKRIPSI": role.get("description") or "",
+                "STATUS": "ACTIVE" if role["is_active"] else "INACTIVE",
+            },
+            parent=self,
+            submit_handler=lambda form: form.accept(),
+        )
+        dialog.inputs["NAMA ROLE"].setMaxLength(100)
+        dialog.inputs["DESKRIPSI"].setMaxLength(2000)
+        if role["code"] == "developer_admin":
+            dialog.inputs["STATUS"].setEnabled(False)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = dialog.values()
+        self._start_mutation(
+            "update",
+            role_id=role["id"],
+            name=values["NAMA ROLE"],
+            description=values["DESKRIPSI"] or None,
+            is_active=values["STATUS"] == "ACTIVE",
+        )
+
+    def open_permissions(self):
+        role = self._selected_role()
+        if role is None or role["code"] == "developer_admin":
+            return
+        dialog = DeveloperSelectionDialog(
+            "Permission Role: " + role["code"],
+            self.permissions,
+            role["permissions"],
+            "Permission yang dicentang akan menggantikan seluruh permission "
+            "role ini. Tidak ada permission yang ditambahkan otomatis.",
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._start_mutation(
+            "permissions",
+            role_id=role["id"],
+            permission_codes=dialog.selected_codes(),
+        )
+
+    def _start_mutation(self, operation, **values):
+        if self.mutation_pending:
+            return
+        self.mutation_pending = True
+        self._update_actions()
+        self.status.setText("Menyimpan perubahan role ke Universal API...")
+        self.status.setStyleSheet("")
+        self.worker = DeveloperRoleMutationWorker(
+            self.api_client, operation, **values
+        )
+        self.worker.saved.connect(self._mutation_saved)
+        self.worker.failed.connect(self._mutation_failed)
+        self.worker.finished.connect(self._mutation_finished)
+        self.worker.start()
+
+    def _mutation_saved(self, operation, result, values):
+        if operation == "create":
+            role = {
+                "id": result["id"],
+                "code": result["code"],
+                "name": result["name"],
+                "description": values["description"],
+                "is_active": True,
+                "permissions": result["permissions"],
+            }
+            self.roles.append(role)
+        elif operation == "update":
+            role = self.role_by_id[result["id"]]
+            role.update(result)
+        else:
+            role = self.role_by_id[result["role_id"]]
+            role["permissions"] = result["permissions"]
+        self.did_change = True
+        self.status.setText("Perubahan role tersimpan melalui Universal API.")
+        self.status.setStyleSheet(f"color:{MUTED_GOLD};")
+        self._show_roles(role["id"])
+
+    def _mutation_failed(self, message):
+        self.status.setText("Gagal menyimpan role: " + message)
+        self.status.setToolTip(message)
+        self.status.setStyleSheet("color:#A32323;")
+
+    def _mutation_finished(self):
+        self.mutation_pending = False
+        self._update_actions()
+
+    def wait_for_mutation(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.wait()
+
+    def closeEvent(self, event):
+        self.wait_for_mutation()
+        super().closeEvent(event)
+
+
+class DeveloperPage(DataPage):
+    PAGE_SIZE = 50
+
+    def __init__(self, api_client):
+        self.api_client = api_client
+        self.offset = 0
+        self.accounts = []
+        self.account_by_id = {}
+        self.roles = []
+        self.permissions = []
+        self.roles_available = False
+        self.permissions_available = False
+        self.role_error = None
+        self.permission_error = None
+        self.accounts_loaded = False
+        self.request_pending = False
+        self.mutation_pending = False
+        self.mutation_succeeded = False
+        self.worker = None
+        self.mutation_worker = None
+        super().__init__(
+            "Pengguna Developer",
+            "Akun pengelola SIMPATI Developer Desktop. Akun Tenant tidak "
+            "ditampilkan pada halaman ini.",
+            [
+                "NO.",
+                "USER ID",
+                "USERNAME",
+                "NAMA LENGKAP",
+                "ROLE",
+                "STATUS",
+                "DIBUAT",
+                "DIPERBARUI",
+            ],
+            filter_column=5,
+            filter_values=("ACTIVE", "INACTIVE"),
+        )
+        self.capability_note = QLabel(
+            "Daftar dan perubahan akun memerlukan auth.developers.manage. "
+            "Katalog role/permission memerlukan auth.roles.manage. Akun baru "
+            "tidak memperoleh role otomatis."
+        )
+        self.capability_note.setObjectName("subtleText")
+        self.capability_note.setWordWrap(True)
+        self.layout().insertWidget(3, self.capability_note)
+        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.toolbar.addWidget(self.refresh_button)
+        self.create_button = QPushButton("+ Tambah Akun")
+        self.create_button.clicked.connect(self.open_create)
+        self.toolbar.addWidget(self.create_button)
+        self.edit_account_button = QPushButton("Edit Informasi")
+        self.edit_account_button.setObjectName("secondaryButton")
+        self.edit_account_button.clicked.connect(self.open_edit)
+        self.toolbar.addWidget(self.edit_account_button)
+        self.status_button = QPushButton("Ubah Status")
+        self.status_button.setObjectName("secondaryButton")
+        self.status_button.clicked.connect(self.toggle_status)
+        self.toolbar.addWidget(self.status_button)
+        self.assign_roles_button = QPushButton("Atur Role")
+        self.assign_roles_button.setObjectName("secondaryButton")
+        self.assign_roles_button.clicked.connect(self.open_assign_roles)
+        self.toolbar.addWidget(self.assign_roles_button)
+        self.reset_password_button = QPushButton("Reset Password")
+        self.reset_password_button.setObjectName("secondaryButton")
+        self.reset_password_button.clicked.connect(self.open_password_reset)
+        self.toolbar.addWidget(self.reset_password_button)
+        self.detail_button = QPushButton("Detail")
+        self.detail_button.setObjectName("secondaryButton")
+        self.detail_button.clicked.connect(self.show_selected_details)
+        self.toolbar.addWidget(self.detail_button)
+        self.manage_roles_button = QPushButton("Kelola Role/Permission")
+        self.manage_roles_button.setObjectName("secondaryButton")
+        self.manage_roles_button.clicked.connect(self.open_role_manager)
+        self.toolbar.addWidget(self.manage_roles_button)
+        self.table.itemSelectionChanged.connect(self._update_actions)
+        self.previous_button = QPushButton("Sebelumnya")
+        self.previous_button.setObjectName("secondaryButton")
+        self.previous_button.clicked.connect(self.previous_page)
+        self.next_button = QPushButton("Berikutnya")
+        self.next_button.setObjectName("secondaryButton")
+        self.next_button.clicked.connect(self.next_page)
+        self.page_label = QLabel("Halaman belum dimuat")
+        self.page_label.setObjectName("subtleText")
+        pagination = QHBoxLayout()
+        pagination.addWidget(self.previous_button)
+        pagination.addWidget(self.page_label)
+        pagination.addStretch()
+        pagination.addWidget(self.next_button)
+        self.layout().insertLayout(self.layout().count() - 1, pagination)
+        self.empty_label.setText(
+            "Buka menu ini untuk memuat akun Developer dari Universal API."
+        )
+        self._update_actions()
+        self._update_pagination_controls()
+
+    def load_page(self, offset=0):
+        if self.request_pending or self.mutation_pending:
+            return
+        if self.api_client is None:
+            self._show_load_error("Client Universal API tidak tersedia.")
+            return
+        if (
+            type(offset) is not int
+            or offset < 0
+            or offset % self.PAGE_SIZE != 0
+        ):
+            self._show_load_error("Offset halaman Developer tidak valid.")
+            return
+        self.offset = offset
+        self.request_pending = True
+        self.accounts_loaded = False
+        self.accounts = []
+        self.account_by_id = {}
+        self.roles = []
+        self.permissions = []
+        self.roles_available = False
+        self.permissions_available = False
+        self.table.setRowCount(0)
+        self.empty_label.setText("Memuat akun Developer...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText(
+            "PENGGUNA DEVELOPER: MEMUAT DARI UNIVERSAL API..."
+        )
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self._update_actions()
+        self._update_pagination_controls()
+        self.worker = DeveloperAccountsLoadWorker(
+            self.api_client, self.PAGE_SIZE, self.offset
+        )
+        self.worker.loaded.connect(self._show_page)
+        self.worker.failed.connect(self._show_load_error)
+        self.worker.finished.connect(self._load_finished)
+        self.worker.start()
+
+    def refresh(self):
+        self.load_page(0)
+
+    def previous_page(self):
+        if self.offset > 0:
+            self.load_page(max(0, self.offset - self.PAGE_SIZE))
+
+    def next_page(self):
+        if len(self.accounts) == self.PAGE_SIZE:
+            self.load_page(self.offset + self.PAGE_SIZE)
+
+    def _show_page(self, data):
+        response = data["accounts"]
+        self.accounts = response["items"]
+        self.accounts_loaded = True
+        self.account_by_id = {
+            account["id"]: account for account in self.accounts
+        }
+        self.roles = data["roles"] or []
+        self.permissions = data["permissions"] or []
+        self.roles_available = data["roles"] is not None
+        self.permissions_available = data["permissions"] is not None
+        self.role_error = data["role_error"]
+        self.permission_error = data["permission_error"]
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(self.accounts))
+            for index, account in enumerate(self.accounts):
+                values = (
+                    self.offset + index + 1,
+                    account["id"],
+                    account["username"],
+                    account["full_name"],
+                    ", ".join(account["roles"]) or "—",
+                    "ACTIVE" if account["is_active"] else "INACTIVE",
+                    account["created_at"],
+                    account["updated_at"],
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column == 1:
+                        item.setData(
+                            Qt.ItemDataRole.UserRole, account["id"]
+                        )
+                    self.table.setItem(index, column, item)
+        finally:
+            self.table.blockSignals(False)
+        self.capability_note.setText(self._capability_text())
+        self.data_status.setText(
+            f"PENGGUNA DEVELOPER: {len(self.accounts)} DIMUAT "
+            f"(OFFSET {self.offset}); TOTAL TIDAK DISEDIAKAN API"
+        )
+        self.data_status.setToolTip(
+            "Endpoint akun Developer tidak mengembalikan total data."
+        )
+        self.data_status.setStyleSheet("")
+        self.page_label.setText(
+            f"Halaman {self.offset // self.PAGE_SIZE + 1} — "
+            f"{len(self.accounts)} akun; total tidak tersedia"
+        )
+        self.refresh_filter_choices()
+        self.filter_table()
+        self._update_actions()
+        self._update_pagination_controls()
+
+    def _capability_text(self):
+        text = (
+            "Daftar dan perubahan akun memerlukan auth.developers.manage. "
+            "Katalog role/permission memerlukan auth.roles.manage. "
+            "Role tidak diberikan otomatis."
+        )
+        if self.role_error:
+            text += " Katalog role tidak tersedia: " + self.role_error
+        if self.permission_error:
+            text += " Katalog permission tidak tersedia: " + self.permission_error
+        return text
+
+    def _show_load_error(self, message):
+        self.data_status.setText(
+            f"PENGGUNA DEVELOPER: GAGAL DIMUAT — {message}"
+        )
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+        if self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Akun Developer tidak dapat dimuat dari Universal API.\n"
+                + message
+            )
+            self.empty_label.setVisible(True)
+
+    def _load_finished(self):
+        self.request_pending = False
+        self._update_actions()
+        self._update_pagination_controls()
+        self.refresh_button.setEnabled(not self.mutation_pending)
+
+    def _update_pagination_controls(self):
+        self.previous_button.setEnabled(
+            not self.request_pending
+            and not self.mutation_pending
+            and self.offset > 0
+        )
+        self.next_button.setEnabled(
+            not self.request_pending
+            and not self.mutation_pending
+            and len(self.accounts) == self.PAGE_SIZE
+        )
+
+    def _selected_account(self):
+        row = self.table.currentRow()
+        item = self.table.item(row, 1) if row >= 0 else None
+        user_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self.account_by_id.get(user_id)
+
+    def _update_actions(self):
+        account = self._selected_account()
+        busy = self.request_pending or self.mutation_pending
+        self.refresh_button.setEnabled(not busy)
+        self.create_button.setEnabled(self.accounts_loaded and not busy)
+        has_selected_account = self.accounts_loaded and account is not None
+        self.edit_account_button.setEnabled(has_selected_account and not busy)
+        self.reset_password_button.setEnabled(
+            has_selected_account and not busy
+        )
+        self.detail_button.setEnabled(has_selected_account and not busy)
+        if has_selected_account:
+            self.status_button.setText(
+                "Nonaktifkan Akun"
+                if account["is_active"]
+                else "Aktifkan Akun"
+            )
+        else:
+            self.status_button.setText("Ubah Status")
+        self.status_button.setEnabled(has_selected_account and not busy)
+        self.assign_roles_button.setEnabled(
+            has_selected_account and self.roles_available and not busy
+        )
+        self.manage_roles_button.setEnabled(
+            self.roles_available and self.permissions_available and not busy
+        )
+        self._update_pagination_controls()
+
+    def open_create(self):
+        dialog = DeveloperAccountDialog(
+            roles=self.roles if self.roles_available else None,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.clear_sensitive_inputs()
+            return
+        values = dialog.values()
+        dialog.clear_sensitive_inputs()
+        self._start_mutation("create", **values)
+
+    def open_edit(self):
+        account = self._selected_account()
+        if account is None:
+            return
+        dialog = DeveloperAccountDialog(account=account, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._start_mutation(
+            "update",
+            user_id=account["id"],
+            full_name=dialog.values()["full_name"],
+        )
+
+    def toggle_status(self):
+        account = self._selected_account()
+        if account is None:
+            return
+        is_active = not account["is_active"]
+        action = "mengaktifkan" if is_active else "menonaktifkan"
+        answer = QMessageBox.question(
+            self,
+            "Konfirmasi Status Akun",
+            f"Apakah Anda yakin ingin {action} akun {account['username']}? "
+            "API dapat menolak penonaktifan Developer Admin terakhir.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._start_mutation(
+            "status", user_id=account["id"], is_active=is_active
+        )
+
+    def open_assign_roles(self):
+        account = self._selected_account()
+        if account is None or not self.roles_available:
+            return
+        active_roles = [
+            role for role in self.roles if role["is_active"]
+        ]
+        dialog = DeveloperSelectionDialog(
+            "Role Akun " + account["username"],
+            active_roles,
+            account["roles"],
+            "Role yang dicentang akan menggantikan role akun. Tidak ada role "
+            "yang ditambahkan otomatis; developer_admin memberikan hak tinggi.",
+            self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._start_mutation(
+            "roles",
+            user_id=account["id"],
+            role_codes=dialog.selected_codes(),
+        )
+
+    def open_password_reset(self):
+        account = self._selected_account()
+        if account is None:
+            return
+        dialog = DeveloperPasswordDialog(account["username"], self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            dialog.clear_passwords()
+            return
+        password = dialog.value()
+        dialog.clear_passwords()
+        self._start_mutation(
+            "password", user_id=account["id"], password=password
+        )
+
+    def open_role_manager(self):
+        if not self.roles_available or not self.permissions_available:
+            self._show_load_error(
+                "Pengelolaan role dan permission memerlukan permission "
+                "auth.roles.manage."
+            )
+            return
+        dialog = DeveloperRoleManagerDialog(
+            self.api_client, self.roles, self.permissions, self
+        )
+        dialog.exec()
+        if dialog.did_change:
+            self.load_page(self.offset)
+
+    def show_selected_details(self):
+        row = self.table.currentRow()
+        if row >= 0:
+            self.show_details(row, 0)
+
+    def show_details(self, row, column):
+        self.table.setCurrentCell(row, column)
+        account = self._selected_account()
+        if account is None:
+            self._show_load_error("Akun Developer yang dipilih tidak valid.")
+            return
+        lines = [
+            f"ID: {account['id']}",
+            f"Username: {account['username']}",
+            f"Nama lengkap: {account['full_name']}",
+            "Status: " + ("ACTIVE" if account["is_active"] else "INACTIVE"),
+            "Role: " + (", ".join(account["roles"]) or "—"),
+            f"Dibuat: {account['created_at']}",
+            f"Diperbarui: {account['updated_at']}",
+            "",
+            "Detail berasal dari endpoint daftar; API tidak menyediakan "
+            "endpoint detail akun tersendiri.",
+        ]
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Detail Akun Developer")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("\n".join(lines))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
+
+    def _start_mutation(self, operation, **values):
+        if self.request_pending or self.mutation_pending:
+            return
+        self.mutation_pending = True
+        self.mutation_succeeded = False
+        self._update_actions()
+        self.data_status.setText(
+            "PENGGUNA DEVELOPER: MENYIMPAN KE UNIVERSAL API..."
+        )
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self.mutation_worker = DeveloperMutationWorker(
+            self.api_client, operation, **values
+        )
+        self.mutation_worker.saved.connect(self._mutation_saved)
+        self.mutation_worker.failed.connect(self._mutation_failed)
+        self.mutation_worker.finished.connect(self._mutation_finished)
+        self.mutation_worker.start()
+
+    def _mutation_saved(self, operation, result):
+        self.mutation_succeeded = True
+        if operation == "password":
+            message = (
+                "Password direset melalui Universal API. Sesi akun dicabut "
+                "oleh API; password tidak ditampilkan atau disimpan."
+            )
+        else:
+            message = "Perubahan akun tersimpan melalui Universal API."
+        self.data_status.setText("PENGGUNA DEVELOPER: " + message)
+        self.data_status.setToolTip(
+            "Respons API tidak menampilkan password atau token."
+        )
+        self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
+
+    def _mutation_failed(self, message):
+        self.data_status.setText(
+            "PENGGUNA DEVELOPER: GAGAL MENYIMPAN — " + message
+        )
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+
+    def _mutation_finished(self):
+        if self.mutation_worker and "password" in self.mutation_worker.values:
+            self.mutation_worker.values["password"] = ""
+        self.mutation_pending = False
+        if self.mutation_succeeded:
+            self.load_page(self.offset)
+        else:
+            self._update_actions()
+            self.refresh_button.setEnabled(True)
+
+    def update_empty_state(self, visible_count=None):
+        if self.table.rowCount() == 0:
+            if self.request_pending:
+                message = "Memuat akun Developer..."
+            elif (
+                hasattr(self, "data_status")
+                and self.data_status.text().startswith(
+                    "PENGGUNA DEVELOPER: GAGAL"
+                )
+            ):
+                message = "Akun Developer belum dapat dimuat."
+            elif self.accounts:
+                message = "Tidak ada akun yang cocok dengan pencarian/filter."
+            else:
+                message = "Belum ada akun pada halaman ini."
+        elif visible_count == 0:
+            message = "Tidak ada akun yang cocok dengan pencarian/filter."
+        else:
+            message = ""
+        self.empty_label.setText(message)
+        self.empty_label.setVisible(bool(message))
+
+    def wait_for_load(self):
+        for worker in (self.worker, self.mutation_worker):
+            if worker and worker.isRunning():
+                worker.wait()
 
 
 class TenantListWorker(QThread):
@@ -2341,6 +4096,7 @@ class ModulePage(DataPage):
 class ConfigurationPage(QWidget):
     def __init__(self):
         super().__init__()
+        self.connection_worker = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 25, 30, 25)
         layout.setSpacing(16)
@@ -2354,18 +4110,48 @@ class ConfigurationPage(QWidget):
         description.setWordWrap(True)
         layout.addWidget(description)
 
-        panel = QFrame()
-        panel.setObjectName("panel")
-        form = QFormLayout(panel)
-        form.setContentsMargins(20, 20, 20, 20)
-        form.setSpacing(14)
-
         settings = settings_store()
+        self.sections_scroll = QScrollArea()
+        self.sections_scroll.setWidgetResizable(True)
+        self.sections_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sections = QWidget()
+        self.sections_layout = QVBoxLayout(sections)
+        self.sections_layout.setContentsMargins(0, 0, 8, 0)
+        self.sections_layout.setSpacing(12)
+        self.sections_scroll.setWidget(sections)
+        layout.addWidget(self.sections_scroll, 1)
+
+        _, identity_form = self._add_section("Identitas Aplikasi")
         self.app_name = QLineEdit(
-            settings.value("branding/app_name", "SIMPATI Developer Desktop")
+            settings.value("branding/app_name", APP_NAME)
         )
+        self.version_value = QLabel(APP_VERSION)
+        self.developer_value = QLabel(APP_DEVELOPER)
+        identity_form.addRow("Nama aplikasi", self.app_name)
+        identity_form.addRow("Versi aplikasi", self.version_value)
+        identity_form.addRow("Developer", self.developer_value)
+
+        _, connection_form = self._add_section("Koneksi Universal API")
         self.api_url = QLineEdit(settings.value("api/base_url", ""))
         self.api_url.setPlaceholderText("https://api.example.com")
+        connection_form.addRow("Alamat API", self.api_url)
+        self.test_connection_button = QPushButton("Uji Koneksi")
+        self.test_connection_button.setObjectName("secondaryButton")
+        self.test_connection_button.clicked.connect(self.test_connection)
+        self.connection_status = make_status_label(
+            "Koneksi Universal API: BELUM DIUJI"
+        )
+        self.connection_status.setWordWrap(True)
+        connection_form.addRow(self.test_connection_button)
+        connection_form.addRow(self.connection_status)
+
+        _, appearance_form = self._add_section("Tampilan")
+        self.theme = QComboBox()
+        self.theme.addItem("Terang", "light")
+        self.theme.addItem("Gelap", "dark")
+        saved_theme = settings.value("appearance/theme", "light")
+        theme_index = self.theme.findData(saved_theme)
+        self.theme.setCurrentIndex(theme_index if theme_index >= 0 else 0)
         self.primary_color = QLineEdit(
             settings.value("branding/primary_color", MAROON)
         )
@@ -2374,33 +4160,112 @@ class ConfigurationPage(QWidget):
         )
         self.primary_color.setMaxLength(7)
         self.accent_color.setMaxLength(7)
-        form.addRow("Nama aplikasi", self.app_name)
-        form.addRow("URL dasar API", self.api_url)
-        form.addRow("Warna maroon (#RRGGBB)", self.primary_color)
-        form.addRow("Warna gold (#RRGGBB)", self.accent_color)
-        layout.addWidget(panel)
+        appearance_form.addRow("Tema", self.theme)
+        appearance_form.addRow("Warna utama (#RRGGBB)", self.primary_color)
+        appearance_form.addRow("Warna aksen (#RRGGBB)", self.accent_color)
 
-        notice = QLabel(
-            "URL hanya disimpan sebagai konfigurasi lokal. Menyimpan URL "
-            "tidak menyimpan secret atau kredensial. URL baru digunakan "
-            "saat login berikutnya; koneksi diperiksa melalui Universal API."
+        _, operation_form = self._add_section("Pengaturan Operasional")
+        self.window_size = QComboBox()
+        self.window_size.addItem("Ringkas — 1024 × 680", "1024x680")
+        self.window_size.addItem("Standar — 1280 × 780", "1280x780")
+        self.window_size.addItem("Besar — 1440 × 900", "1440x900")
+        saved_size = settings.value(
+            "operational/window_size", "1280x780"
         )
-        notice.setObjectName("subtleText")
-        notice.setWordWrap(True)
-        layout.addWidget(notice)
+        size_index = self.window_size.findData(saved_size)
+        self.window_size.setCurrentIndex(size_index if size_index >= 0 else 1)
+        operation_form.addRow("Ukuran jendela", self.window_size)
 
-        self.result = QLabel()
-        self.result.setWordWrap(True)
-        layout.addWidget(self.result)
+        _, security_form = self._add_section("Keamanan")
+        security_info = QLabel(
+            "Token akses dan refresh disimpan melalui keyring sistem operasi. "
+            "Password tidak disimpan. Masa berlaku sesi ditentukan Universal "
+            "API; Desktop tidak mengatur timeout sesi lokal."
+        )
+        security_info.setWordWrap(True)
+        security_info.setStyleSheet("font-weight: normal;")
+        security_form.addRow(security_info)
+
+        self.settings_notice = QLabel(
+            "Pengaturan aplikasi disimpan lokal melalui QSettings. Alamat API "
+            "tidak berisi kredensial; pengaturan lokal tidak mengubah "
+            "konfigurasi pusat Universal API."
+        )
+        self.settings_notice.setObjectName("subtleText")
+        self.settings_notice.setWordWrap(True)
+        self.sections_layout.addWidget(self.settings_notice)
+        self.sections_layout.addStretch()
+
         save_button = QPushButton("Simpan pengaturan lokal")
         save_button.clicked.connect(self.save_settings)
         layout.addWidget(save_button, alignment=Qt.AlignmentFlag.AlignLeft)
-        layout.addStretch()
+
+    def _add_section(self, title):
+        panel = QFrame()
+        panel.setObjectName("panel")
+        section_layout = QVBoxLayout(panel)
+        section_layout.setContentsMargins(20, 16, 20, 18)
+        section_layout.setSpacing(10)
+        heading = QLabel(title)
+        heading.setObjectName("configSectionTitle")
+        section_layout.addWidget(heading)
+        form = QFormLayout()
+        form.setSpacing(12)
+        section_layout.addLayout(form)
+        self.sections_layout.addWidget(panel)
+        return panel, form
+
+    def test_connection(self):
+        if self.connection_worker and self.connection_worker.isRunning():
+            return
+        try:
+            api_url = ApiClient.validate_base_url(self.api_url.text())
+            probe_client = ApiClient(api_url)
+        except ApiError as exc:
+            self._show_connection_result(False, str(exc))
+            return
+
+        self.connection_status.setText(
+            "Koneksi Universal API: SEDANG DIUJI..."
+        )
+        self.connection_status.setToolTip("")
+        self.connection_status.setStyleSheet("")
+        self.test_connection_button.setEnabled(False)
+        self.connection_worker = ConnectionCheckWorker(probe_client)
+        self.connection_worker.checked.connect(
+            self._show_connection_result
+        )
+        self.connection_worker.finished.connect(
+            self._connection_test_finished
+        )
+        self.connection_worker.start()
+
+    def _show_connection_result(self, connected, message):
+        if connected:
+            self.connection_status.setText(
+                "Koneksi Universal API: TERHUBUNG"
+            )
+            self.connection_status.setStyleSheet(
+                f"color:{MUTED_GOLD};"
+            )
+        else:
+            self.connection_status.setText(
+                "Koneksi Universal API: GAGAL — " + message
+            )
+            self.connection_status.setStyleSheet("color:#A32323;")
+        self.connection_status.setToolTip(message)
+
+    def _connection_test_finished(self):
+        self.test_connection_button.setEnabled(True)
+
+    def wait_for_connection_test(self):
+        if self.connection_worker and self.connection_worker.isRunning():
+            self.connection_worker.wait()
 
     def save_settings(self):
         if not self.app_name.text().strip():
-            self.result.setText("Nama aplikasi wajib diisi.")
-            self.result.setStyleSheet("color:#A32323;")
+            self.settings_notice.setText("Nama aplikasi wajib diisi.")
+            self.settings_notice.setStyleSheet("color:#A32323;")
             return False
 
         api_url = self.api_url.text().strip()
@@ -2408,11 +4273,11 @@ class ConfigurationPage(QWidget):
             try:
                 api_url = ApiClient.validate_base_url(api_url)
             except ApiError:
-                self.result.setText(
+                self.settings_notice.setText(
                     "URL API harus berupa URL lengkap dengan skema "
                     "http:// atau https://."
                 )
-                self.result.setStyleSheet("color:#A32323;")
+                self.settings_notice.setStyleSheet("color:#A32323;")
                 return False
 
         primary_text = self.primary_color.text().strip()
@@ -2421,33 +4286,239 @@ class ConfigurationPage(QWidget):
         if not re.fullmatch(color_pattern, primary_text) or not re.fullmatch(
             color_pattern, accent_text
         ):
-            self.result.setText(
+            self.settings_notice.setText(
                 "Format warna tidak valid. Gunakan format warna, misalnya "
                 "#420D18."
             )
-            self.result.setStyleSheet("color:#A32323;")
+            self.settings_notice.setStyleSheet("color:#A32323;")
             return False
         primary = QColor(primary_text)
         accent = QColor(accent_text)
+        window_size = self.window_size.currentData()
+        if window_size not in WINDOW_SIZES:
+            self.settings_notice.setText(
+                "Ukuran jendela yang dipilih tidak valid."
+            )
+            self.settings_notice.setStyleSheet("color:#A32323;")
+            return False
 
         settings = settings_store()
         settings.setValue("branding/app_name", self.app_name.text().strip())
         settings.setValue("api/base_url", api_url)
         settings.setValue("branding/primary_color", primary.name())
         settings.setValue("branding/accent_color", accent.name())
+        settings.setValue("appearance/theme", self.theme.currentData())
+        settings.setValue("operational/window_size", window_size)
         settings.sync()
         if settings.status() != QSettings.Status.NoError:
-            self.result.setText("Pengaturan gagal disimpan ke penyimpanan lokal.")
-            self.result.setStyleSheet("color:#A32323;")
+            self.settings_notice.setText(
+                "Pengaturan gagal disimpan ke penyimpanan lokal."
+            )
+            self.settings_notice.setStyleSheet("color:#A32323;")
             return False
 
-        self.result.setText(
-            "Pengaturan lokal berhasil disimpan. Perubahan branding "
-            "diterapkan setelah aplikasi dijalankan ulang; URL API "
-            "digunakan pada login berikutnya."
+        apply_saved_branding()
+        window = self.window()
+        if isinstance(window, MainWindow):
+            window.apply_local_configuration()
+        self.settings_notice.setText(
+            "Pengaturan lokal berhasil disimpan. Tampilan dan ukuran "
+            "diterapkan sekarang; alamat API digunakan pada login berikutnya."
         )
-        self.result.setStyleSheet(f"color:{MUTED_GOLD};")
+        self.settings_notice.setStyleSheet(f"color:{MUTED_GOLD};")
         return True
+
+
+class BackupRecoveryPage(QWidget):
+    OPERATIONS = (
+        (
+            "Membuat backup database",
+            "BELUM TERSEDIA",
+            "Universal API belum menyediakan operasi backup database.",
+        ),
+        (
+            "Melihat daftar backup",
+            "BELUM TERSEDIA",
+            "Belum ada model arsip atau endpoint daftar backup.",
+        ),
+        (
+            "Mengunduh backup",
+            "BELUM TERSEDIA",
+            "Belum ada endpoint unduh arsip backup yang aman.",
+        ),
+        (
+            "Memulihkan database",
+            "BELUM TERSEDIA",
+            "Belum ada mekanisme restore atau konfirmasi restore resmi.",
+        ),
+        (
+            "Menghapus arsip backup",
+            "BELUM TERSEDIA",
+            "Belum ada penghapusan arsip atau mekanisme perlindungannya.",
+        ),
+        (
+            "Status dan riwayat proses",
+            "BELUM TERSEDIA",
+            "Belum ada status pekerjaan maupun riwayat backup/restore.",
+        ),
+    )
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(14)
+        layout.addWidget(make_title("Manajemen Backup dan Pemulihan"))
+
+        self.readiness_status = make_status_label(
+            "BACKUP DATABASE: BELUM DIDUKUNG UNIVERSAL API"
+        )
+        self.readiness_status.setStyleSheet("color:#A32323;")
+        layout.addWidget(self.readiness_status)
+
+        supported_note = QLabel(
+            "Yang tersedia: GET /health/ready (alias GET /health) hanya "
+            "memeriksa kesiapan koneksi database. Pemeriksaan ini bukan "
+            "backup, ekspor data, atau pemulihan database."
+        )
+        supported_note.setObjectName("subtleText")
+        supported_note.setWordWrap(True)
+        layout.addWidget(supported_note)
+
+        self.operation_table = QTableWidget(
+            len(self.OPERATIONS), 3
+        )
+        self.operation_table.setHorizontalHeaderLabels(
+            ["KEMAMPUAN", "STATUS", "KETERANGAN"]
+        )
+        self.operation_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.operation_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection
+        )
+        self.operation_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.operation_table.horizontalHeader().setStretchLastSection(True)
+        for row, values in enumerate(self.OPERATIONS):
+            for column, value in enumerate(values):
+                self.operation_table.setItem(
+                    row, column, QTableWidgetItem(value)
+                )
+        layout.addWidget(self.operation_table, 1)
+
+        security_note = QLabel(
+            "Operasi backup dan restore belum diaktifkan. Desktop tidak "
+            "mengakses database, menjalankan ekspor sebagai pengganti "
+            "backup, atau menyediakan kontrol hapus/restore yang belum "
+            "didukung backend. Pemulihan Tenant dari recycle bin tidak "
+            "memulihkan database."
+        )
+        security_note.setObjectName("subtleText")
+        security_note.setWordWrap(True)
+        layout.addWidget(security_note)
+
+
+class DeveloperNotificationsPage(QWidget):
+    CAPABILITIES = (
+        (
+            "Daftar notifikasi Developer",
+            "BELUM TERSEDIA",
+            "Universal API belum menyediakan model atau endpoint feed "
+            "notifikasi Developer.",
+        ),
+        (
+            "Aktivitas audit sistem",
+            "TERSEDIA TERPISAH",
+            "GET /auth/audit-logs tersedia di menu Audit Log; catatan audit "
+            "bukan notifikasi.",
+        ),
+        (
+            "Tenant dan waktu kejadian notifikasi",
+            "BELUM TERSEDIA",
+            "API tidak menyediakan objek notifikasi dengan metadata ini.",
+        ),
+        (
+            "Kategori dan tingkat kepentingan",
+            "BELUM TERSEDIA",
+            "Kategori dan severity notifikasi belum dimodelkan.",
+        ),
+        (
+            "Status sudah/belum dibaca",
+            "BELUM TERSEDIA",
+            "API tidak menyediakan status baca notifikasi.",
+        ),
+        (
+            "Filter dan pencarian notifikasi",
+            "BELUM TERSEDIA",
+            "Tidak ada endpoint feed atau parameter filter notifikasi.",
+        ),
+        (
+            "Event dan webhook",
+            "BELUM TERSEDIA",
+            "API tidak menyediakan endpoint event subscription, webhook, "
+            "atau delivery history.",
+        ),
+        (
+            "Muat ulang feed notifikasi",
+            "BELUM TERSEDIA",
+            "Tidak ada sumber notifikasi backend untuk dimuat ulang.",
+        ),
+    )
+
+    def __init__(self):
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(14)
+        layout.addWidget(make_title("Manajemen Notifikasi Developer"))
+
+        self.readiness_status = make_status_label(
+            "NOTIFIKASI DEVELOPER: BELUM DIDUKUNG UNIVERSAL API"
+        )
+        self.readiness_status.setStyleSheet("color:#A32323;")
+        layout.addWidget(self.readiness_status)
+
+        note = QLabel(
+            "Halaman ini menjelaskan kesiapan backend, bukan feed notifikasi. "
+            "Tidak ada data contoh atau penyimpanan notifikasi lokal."
+        )
+        note.setObjectName("subtleText")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        self.capability_table = QTableWidget(
+            len(self.CAPABILITIES), 3
+        )
+        self.capability_table.setHorizontalHeaderLabels(
+            ["KEMAMPUAN", "STATUS", "KETERANGAN"]
+        )
+        self.capability_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.capability_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection
+        )
+        self.capability_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.capability_table.horizontalHeader().setStretchLastSection(True)
+        for row, values in enumerate(self.CAPABILITIES):
+            for column, value in enumerate(values):
+                self.capability_table.setItem(
+                    row, column, QTableWidgetItem(value)
+                )
+        layout.addWidget(self.capability_table, 1)
+
+        separation_note = QLabel(
+            "Audit Log tetap tersedia secara terpisah dan tidak menyediakan "
+            "kategori, prioritas, status baca, atau pengiriman notifikasi. "
+            "Halaman ini tidak mengubah atau menghapus catatan audit."
+        )
+        separation_note.setObjectName("subtleText")
+        separation_note.setWordWrap(True)
+        layout.addWidget(separation_note)
 
 
 class MainWindow(QMainWindow):
@@ -2460,6 +4531,8 @@ class MainWindow(QMainWindow):
         ("Konfigurasi", "configuration"),
         ("Pengguna Developer", "developers"),
         ("Audit Log", "audit"),
+        ("Notifikasi Developer", "notifications"),
+        ("Backup & Pemulihan", "backup_recovery"),
     )
 
     def __init__(self, api_client=None, user=None):
@@ -2467,13 +4540,7 @@ class MainWindow(QMainWindow):
         self.api_client = api_client
         self.user = user or {}
         self.connection_worker = None
-        self.setWindowTitle(
-            settings_store().value(
-                "branding/app_name", "SIMPATI Developer Desktop"
-            )
-        )
         self.setMinimumSize(900, 600)
-        self.resize(1280, 780)
         self.menu_buttons = {}
         self.page_by_key = {}
 
@@ -2541,7 +4608,7 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(sidebar)
         root_layout.addWidget(content, 1)
-        self.setStyleSheet(self.stylesheet())
+        self.apply_local_configuration()
         self.navigate("dashboard")
         if self.api_client:
             self.dashboard_page = self.page_by_key["dashboard"]
@@ -2565,43 +4632,10 @@ class MainWindow(QMainWindow):
             "licenses": LicensePage(self.api_client),
             "installations": InstallationPage(self.api_client),
             "modules": ModulePage(self.api_client),
-            "developers": DataPage(
-                "Pengguna Developer",
-                "Akun, peran, status, dan akses developer.",
-                [
-                    "NO.",
-                    "USER ID",
-                    "USERNAME",
-                    "NAMA",
-                    "PERAN",
-                    "STATUS",
-                    "TERAKHIR LOGIN",
-                ],
-                [
-                    ("USER ID", True),
-                    ("USERNAME", True),
-                    ("NAMA", True),
-                    ("PERAN", True),
-                    ("STATUS", True),
-                ],
-                filter_column=5,
-                filter_values=("ACTIVE", "INACTIVE", "LOCKED"),
-                add_label="Tambah Pengguna",
-            ),
-            "audit": DataPage(
-                "Audit Log",
-                "Riwayat aktivitas dan perubahan yang tercatat di sistem.",
-                [
-                    "NO.",
-                    "WAKTU",
-                    "PENGGUNA",
-                    "TINDAKAN",
-                    "OBJEK",
-                    "RINGKASAN",
-                ],
-                filter_column=3,
-                filter_values=(),
-            ),
+            "developers": DeveloperPage(self.api_client),
+            "audit": AuditLogPage(self.api_client),
+            "notifications": DeveloperNotificationsPage(),
+            "backup_recovery": BackupRecoveryPage(),
             "configuration": ConfigurationPage(),
         }
         for menu_item in self.MENU:
@@ -2610,26 +4644,58 @@ class MainWindow(QMainWindow):
             self.page_by_key[key] = page
             self.pages.addWidget(page)
         self.dashboard_page = pages["dashboard"]
+        self.dashboard_page.health_check_requested.connect(
+            self.start_connection_check
+        )
 
     def start_connection_check(self):
         if not self.api_client or not self.api_client.base_url:
-            self._set_api_status(False, "API: BELUM DIKONFIGURASI")
+            self._set_api_status(
+                {
+                    "api": {
+                        "connected": False,
+                        "message": "Alamat Universal API belum dikonfigurasi.",
+                        "response_ms": None,
+                        "checked_at": None,
+                    },
+                    "database": {
+                        "status": "N/D",
+                        "message": "Universal API belum dikonfigurasi.",
+                        "response_ms": None,
+                        "checked_at": None,
+                    },
+                }
+            )
             return
         if self.connection_worker and self.connection_worker.isRunning():
             return
-        self.connection_worker = ConnectionCheckWorker(self.api_client)
+        self.dashboard_page.show_api_checking()
+        self.api_status.setText("API: MEMERIKSA...")
+        self.api_status.setToolTip("Endpoint GET /health/live sedang diperiksa.")
+        self.connection_worker = DashboardMonitoringWorker(self.api_client)
         self.connection_worker.checked.connect(self._set_api_status)
         self.connection_worker.start()
 
-    def _set_api_status(self, connected, message):
+    def _set_api_status(self, result):
+        api = result["api"]
+        database = result["database"]
+        connected = api["connected"]
+        message = api["message"]
         state = "TERHUBUNG" if connected else "TERPUTUS"
         self.api_status.setText(f"API: {state}")
         self.api_status.setToolTip(message)
-        self.dashboard_page.api_status.setText(f"API: {state}")
-        self.dashboard_page.api_status.setToolTip(message)
         color = MUTED_GOLD if connected else "#A32323"
         self.api_status.setStyleSheet(f"color:{color};")
-        self.dashboard_page.api_status.setStyleSheet(f"color:{color};")
+        self.dashboard_page.show_api_health(
+            connected=connected,
+            message=message,
+            response_ms=api["response_ms"],
+            checked_at=api["checked_at"],
+            database_status=database["status"],
+            database_message=database["message"],
+            database_response_ms=database["response_ms"],
+            database_checked_at=database["checked_at"],
+        )
 
     def logout(self):
         if not self.api_client:
@@ -2650,11 +4716,14 @@ class MainWindow(QMainWindow):
                 or self.user.get("username", "")
             )
             self.navigate("dashboard")
-            self._set_api_status(True, "API: TERHUBUNG")
+            self.start_connection_check()
             return
         self.close()
 
     def closeEvent(self, event):
+        configuration_page = self.page_by_key.get("configuration")
+        if configuration_page is not None:
+            configuration_page.wait_for_connection_test()
         tenant_page = self.page_by_key.get("tenants")
         if tenant_page is not None:
             tenant_page.wait_for_load()
@@ -2664,6 +4733,12 @@ class MainWindow(QMainWindow):
         module_page = self.page_by_key.get("modules")
         if module_page is not None:
             module_page.wait_for_load()
+        audit_page = self.page_by_key.get("audit")
+        if audit_page is not None:
+            audit_page.wait_for_load()
+        developer_page = self.page_by_key.get("developers")
+        if developer_page is not None:
+            developer_page.wait_for_load()
         license_page = self.page_by_key.get("licenses")
         if license_page is not None:
             license_page.wait_for_load()
@@ -2675,6 +4750,21 @@ class MainWindow(QMainWindow):
         ):
             self.connection_worker.wait()
         super().closeEvent(event)
+
+    def apply_local_configuration(self):
+        settings = settings_store()
+        app_name = settings.value("branding/app_name", APP_NAME)
+        self.setWindowTitle(app_name)
+        size_key = settings.value(
+            "operational/window_size", "1280x780"
+        )
+        self.resize(*WINDOW_SIZES.get(size_key, WINDOW_SIZES["1280x780"]))
+        self.setStyleSheet(
+            self.stylesheet(settings.value("appearance/theme", "light"))
+        )
+        app = QApplication.instance()
+        if app is not None:
+            app.setApplicationName(app_name)
 
     def navigate(self, page_key):
         page = self.page_by_key.get(page_key)
@@ -2689,16 +4779,46 @@ class MainWindow(QMainWindow):
             page.load_modules()
         if page_key == "dashboard" and self.api_client:
             page.load_dashboard()
+            if getattr(self, "connection_timer", None) is not None:
+                self.start_connection_check()
+        if page_key == "audit" and self.api_client:
+            page.load_page(0)
+        if page_key == "developers" and self.api_client:
+            page.load_page(0)
         for key, button in self.menu_buttons.items():
             button.setProperty("active", key == page_key)
             button.style().unpolish(button)
             button.style().polish(button)
 
     @staticmethod
-    def stylesheet():
+    def stylesheet(theme="light"):
+        if theme == "dark":
+            background = "#1E1E1E"
+            surface = "#292929"
+            text = "#E8E6E3"
+            muted_text = "#B8B3AD"
+            border = "#49443E"
+            alternate = "#323232"
+            header = "#38332D"
+            selected = "#56431D"
+            secondary = "#3B3230"
+            heading_color = GOLD
+            accent_text = "#E8C968"
+        else:
+            background = BACKGROUND
+            surface = "white"
+            text = "#333333"
+            muted_text = "#666666"
+            border = "#E5DED5"
+            alternate = "#F8F6F2"
+            header = "#EEE9E1"
+            selected = "#E9DFD0"
+            secondary = "#E8E1D8"
+            heading_color = MAROON
+            accent_text = MUTED_GOLD
         return f"""
             QMainWindow, QWidget#content {{
-                background-color: {BACKGROUND};
+                background-color: {background};
             }}
             QWidget#sidebar {{
                 background-color: {DARK};
@@ -2714,50 +4834,55 @@ class MainWindow(QMainWindow):
                 letter-spacing: 2px;
             }}
             QLabel#pageTitle {{
-                color: {MAROON};
+                color: {heading_color};
                 font-size: 26px;
                 font-weight: bold;
             }}
+            QLabel#configSectionTitle {{
+                color: {MAROON};
+                font-size: 15px;
+                font-weight: bold;
+            }}
             QLabel#roleTag, QLabel#connectionStatus {{
-                color: {MUTED_GOLD};
+                color: {accent_text};
                 font-size: 11px;
                 font-weight: bold;
                 padding: 3px;
             }}
             QLabel#subtleText {{
-                color: #666666;
+                color: {muted_text};
                 font-size: 12px;
             }}
             QLabel#emptyState {{
-                color: #777777;
-                background: white;
-                border: 1px solid #E5DED5;
+                color: {muted_text};
+                background: {surface};
+                border: 1px solid {border};
                 border-radius: 8px;
                 padding: 14px;
             }}
             QLabel#statLabel {{
-                color: #777777;
+                color: {muted_text};
                 font-size: 10px;
                 font-weight: bold;
             }}
             QLabel#statValue {{
-                color: {MAROON};
+                color: {heading_color};
                 font-size: 28px;
                 font-weight: bold;
             }}
             QFrame#statCard, QFrame#panel {{
-                background: white;
-                border: 1px solid #E5DED5;
+                background: {surface};
+                border: 1px solid {border};
                 border-radius: 8px;
             }}
             QFrame#panel QLabel {{
-                color: {MAROON};
+                color: {text};
                 font-weight: bold;
             }}
             QLineEdit, QComboBox {{
-                background: white;
-                color: #333333;
-                border: 1px solid #D6CEC3;
+                background: {surface};
+                color: {text};
+                border: 1px solid {border};
                 border-radius: 6px;
                 padding: 9px;
                 min-height: 20px;
@@ -2781,8 +4906,8 @@ class MainWindow(QMainWindow):
                 color: #888888;
             }}
             QPushButton#secondaryButton {{
-                color: {MAROON};
-                background: #E8E1D8;
+                color: {text if theme == "dark" else MAROON};
+                background: {secondary};
             }}
             QPushButton#navButton {{
                 color: white;
@@ -2795,24 +4920,24 @@ class MainWindow(QMainWindow):
                 background: {MAROON};
             }}
             QTableWidget {{
-                background: white;
-                alternate-background-color: #F8F6F2;
-                color: #333333;
-                border: 1px solid #E5DED5;
+                background: {surface};
+                alternate-background-color: {alternate};
+                color: {text};
+                border: 1px solid {border};
                 border-radius: 7px;
-                selection-background-color: #E9DFD0;
-                selection-color: {MAROON};
+                selection-background-color: {selected};
+                selection-color: {text if theme == "dark" else MAROON};
             }}
             QHeaderView::section {{
-                color: {MAROON};
-                background: #EEE9E1;
+                color: {text if theme == "dark" else MAROON};
+                background: {header};
                 border: none;
                 padding: 9px 5px;
                 font-weight: bold;
                 font-size: 10px;
             }}
             QDialog {{
-                background: {BACKGROUND};
+                background: {background};
             }}
         """
 
@@ -2820,7 +4945,7 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     apply_saved_branding()
     app = QApplication(sys.argv)
-    app.setApplicationName("SIMPATI Developer Desktop")
+    app.setApplicationName(APP_NAME)
     app.setOrganizationName("SIMPATI")
     api_client = ApiClient()
     user = None

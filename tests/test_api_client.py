@@ -609,8 +609,14 @@ class ApiClientTests(unittest.TestCase):
     def test_recent_audit_logs_use_latest_page_and_validate_metadata(self):
         logs = [
             {
+                "id": 18,
+                "tenant_id": None,
+                "actor_type": "DEVELOPER",
+                "actor_id": 4,
                 "action": "TENANT_CREATED",
                 "entity": "Tenant",
+                "entity_id": "31",
+                "details": {"result": "success"},
                 "created_at": "2026-11-17T00:00:00+00:00",
             }
         ]
@@ -632,6 +638,310 @@ class ApiClientTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ApiError, "audit log"):
                 self.client.list_recent_audit_logs()
+
+    def test_developer_accounts_use_supported_list_endpoint_and_pagination(self):
+        account = {
+            "id": 8,
+            "username": "developer.ops",
+            "full_name": "Developer Ops",
+            "is_active": True,
+            "roles": ["developer_ops"],
+            "created_at": "2026-11-17T00:00:00+00:00",
+            "updated_at": "2026-11-17T01:00:00+00:00",
+        }
+        response = {"items": [account], "limit": 50, "offset": 100}
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            result = self.client.list_developer_accounts(50, 100)
+
+        self.assertEqual(result, response)
+        request.assert_called_once_with(
+            "GET",
+            "/auth/developers?limit=50&offset=100",
+            authenticated=True,
+        )
+
+        with patch.object(
+            self.client,
+            "request",
+            return_value={
+                "items": [{**account, "password_hash": "never-return-this"}],
+                "limit": 50,
+                "offset": 0,
+            },
+        ):
+            with self.assertRaisesRegex(ApiError, "akun Developer"):
+                self.client.list_developer_accounts()
+
+    def test_developer_creation_uses_empty_roles_by_default(self):
+        response = {
+            "id": 12,
+            "username": "new.developer",
+            "full_name": "New Developer",
+            "is_active": True,
+            "role_codes": [],
+        }
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            result = self.client.create_developer_account(
+                "New.Developer", "secure-initial-password", " New Developer "
+            )
+
+        request.assert_called_once_with(
+            "POST",
+            "/auth/developer/register",
+            {
+                "username": "new.developer",
+                "password": "secure-initial-password",
+                "full_name": "New Developer",
+                "role_codes": [],
+            },
+            authenticated=True,
+        )
+        self.assertNotIn("password", result)
+
+        with patch.object(self.client, "request") as request:
+            with self.assertRaisesRegex(ApiError, "12–256"):
+                self.client.create_developer_account(
+                    "new.developer", "short", "New Developer"
+                )
+        request.assert_not_called()
+
+    def test_developer_edit_status_password_reset_and_role_assignment_routes(self):
+        account = {
+            "id": 12,
+            "username": "new.developer",
+            "full_name": "Updated Developer",
+            "is_active": True,
+        }
+        with patch.object(
+            self.client, "request", return_value=account
+        ) as request:
+            self.client.update_developer_account(12, "Updated Developer")
+        request.assert_called_once_with(
+            "PATCH",
+            "/auth/developers/12",
+            {"full_name": "Updated Developer"},
+            authenticated=True,
+        )
+
+        inactive_account = {**account, "is_active": False}
+        with patch.object(
+            self.client, "request", return_value=inactive_account
+        ) as request:
+            self.client.set_developer_account_active(12, False)
+        request.assert_called_once_with(
+            "PATCH",
+            "/auth/developers/12",
+            {"is_active": False},
+            authenticated=True,
+        )
+
+        with patch.object(
+            self.client, "request", return_value=account
+        ) as request:
+            result = self.client.reset_developer_password(
+                12, "replacement-password"
+            )
+        request.assert_called_once_with(
+            "PATCH",
+            "/auth/developers/12",
+            {"password": "replacement-password"},
+            authenticated=True,
+        )
+        self.assertNotIn("password", result)
+
+        with patch.object(
+            self.client,
+            "request",
+            return_value={"user_id": 12, "role_codes": ["developer_ops"]},
+        ) as request:
+            self.client.assign_developer_roles(12, ["developer_ops"])
+        request.assert_called_once_with(
+            "PUT",
+            "/auth/developers/12/roles",
+            {"role_codes": ["developer_ops"]},
+            authenticated=True,
+        )
+
+    def test_developer_role_and_permission_catalogs_use_role_permission_routes(self):
+        roles = [
+            {
+                "id": 3,
+                "code": "developer_ops",
+                "name": "Operations",
+                "description": None,
+                "is_active": True,
+                "permissions": ["tenants.read"],
+            }
+        ]
+        permissions = [
+            {
+                "code": "tenants.read",
+                "name": "Read tenants",
+                "module": "tenants",
+            }
+        ]
+        with patch.object(
+            self.client, "request", return_value=roles
+        ) as request:
+            self.assertEqual(self.client.list_developer_roles(), roles)
+        request.assert_called_once_with(
+            "GET", "/auth/developer-roles", authenticated=True
+        )
+
+        with patch.object(
+            self.client, "request", return_value=permissions
+        ) as request:
+            self.assertEqual(
+                self.client.list_developer_permissions(), permissions
+            )
+        request.assert_called_once_with(
+            "GET", "/auth/permissions", authenticated=True
+        )
+
+        created_role = {
+            "id": 4,
+            "code": "developer_viewer",
+            "name": "Viewer",
+            "permissions": ["tenants.read"],
+        }
+        with patch.object(
+            self.client, "request", return_value=created_role
+        ) as request:
+            self.client.create_developer_role(
+                "Developer_Viewer",
+                "Viewer",
+                permission_codes=["tenants.read"],
+            )
+        request.assert_called_once_with(
+            "POST",
+            "/auth/developer-roles",
+            {
+                "code": "developer_viewer",
+                "name": "Viewer",
+                "description": None,
+                "permission_codes": ["tenants.read"],
+            },
+            authenticated=True,
+        )
+
+        updated_role = {
+            "id": 4,
+            "code": "developer_viewer",
+            "name": "Auditor",
+            "description": "Read only",
+            "is_active": False,
+        }
+        with patch.object(
+            self.client, "request", return_value=updated_role
+        ) as request:
+            self.client.update_developer_role(
+                4, "Auditor", "Read only", False
+            )
+        request.assert_called_once_with(
+            "PATCH",
+            "/auth/developer-roles/4",
+            {
+                "name": "Auditor",
+                "description": "Read only",
+                "is_active": False,
+            },
+            authenticated=True,
+        )
+
+        with patch.object(
+            self.client,
+            "request",
+            return_value={"role_id": 4, "permissions": []},
+        ) as request:
+            self.client.set_developer_role_permissions(4, [])
+        request.assert_called_once_with(
+            "PUT",
+            "/auth/developer-roles/4/permissions",
+            {"permission_codes": []},
+            authenticated=True,
+        )
+
+    def test_reserved_developer_admin_role_cannot_be_created(self):
+        with patch.object(self.client, "request") as request:
+            with self.assertRaisesRegex(ApiError, "developer_admin"):
+                self.client.create_developer_role(
+                    "developer_admin", "Developer Admin"
+                )
+        request.assert_not_called()
+
+    def test_audit_log_list_uses_api_pagination_and_optional_tenant_filter(self):
+        log = {
+            "id": 28,
+            "tenant_id": 31,
+            "actor_type": "TENANT",
+            "actor_id": 9,
+            "action": "MEMBER_UPDATED",
+            "entity": "Member",
+            "entity_id": "12",
+            "details": {"result": "success"},
+            "created_at": "2026-11-17T00:00:00+00:00",
+        }
+        response = {"items": [log], "limit": 50, "offset": 100}
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            result = self.client.list_audit_logs(limit=50, offset=100)
+
+        self.assertEqual(result, response)
+        request.assert_called_once_with(
+            "GET",
+            "/auth/audit-logs?limit=50&offset=100",
+            authenticated=True,
+        )
+
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            self.client.list_audit_logs(
+                limit=50, offset=100, tenant_id=31
+            )
+
+        request.assert_called_once_with(
+            "GET",
+            "/auth/audit-logs?limit=50&offset=100&tenant_id=31",
+            authenticated=True,
+        )
+
+    def test_audit_log_list_validates_pagination_and_record_shape(self):
+        with patch.object(self.client, "request") as request:
+            with self.assertRaisesRegex(ApiError, "Offset"):
+                self.client.list_audit_logs(limit=50, offset=-1)
+            with self.assertRaisesRegex(ApiError, "ID Tenant"):
+                self.client.list_audit_logs(tenant_id=0)
+
+        request.assert_not_called()
+        with patch.object(
+            self.client,
+            "request",
+            return_value={
+                "items": [
+                    {
+                        "id": 1,
+                        "tenant_id": None,
+                        "actor_type": "INVALID",
+                        "actor_id": None,
+                        "action": "LOGIN",
+                        "entity": "Session",
+                        "entity_id": None,
+                        "details": None,
+                        "created_at": "2026-11-17T00:00:00+00:00",
+                    }
+                ],
+                "limit": 50,
+                "offset": 0,
+            },
+        ):
+            with self.assertRaisesRegex(ApiError, "audit log"):
+                self.client.list_audit_logs()
 
     def test_tenant_module_listing_uses_supported_assignment_endpoint(self):
         module = {
@@ -767,6 +1077,23 @@ class ApiClientTests(unittest.TestCase):
                 self.client.change_tenant_status(31, "INACTIVE", "No")
 
         request.assert_not_called()
+
+    def test_database_readiness_uses_official_public_endpoint(self):
+        response = {"status": "ONLINE", "database": "CONNECTED"}
+        with patch.object(self.client, "_send", return_value=response) as send:
+            result = self.client.check_database_readiness()
+
+        self.assertEqual(result, response)
+        send.assert_called_once_with("GET", "/health/ready")
+
+    def test_database_readiness_rejects_unconfirmed_database_status(self):
+        with patch.object(
+            self.client,
+            "_send",
+            return_value={"status": "ONLINE", "database": "DISCONNECTED"},
+        ):
+            with self.assertRaisesRegex(ApiError, "tidak mengonfirmasi"):
+                self.client.check_database_readiness()
 
     @patch("api_client.urlopen", side_effect=URLError("network unavailable"))
     def test_connection_failure_is_reported(self, _urlopen):

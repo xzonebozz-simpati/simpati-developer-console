@@ -5,20 +5,32 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QLabel,
+    QLineEdit,
     QMessageBox,
+    QPushButton,
     QTableWidgetItem,
 )
 
 from main import (
+    AuditLogPage,
+    BackupRecoveryPage,
     ConfigurationPage,
     DashboardLoadWorker,
+    DashboardMonitoringWorker,
     DashboardPage,
     DataPage,
+    DeveloperAccountDialog,
+    DeveloperPage,
+    DeveloperPasswordDialog,
+    DeveloperRoleManagerDialog,
+    DeveloperSelectionDialog,
+    DeveloperNotificationsPage,
     FormDialog,
     InstallationPage,
     LicensePage,
@@ -50,16 +62,68 @@ class DesktopApplicationTests(unittest.TestCase):
             )
         self.assertEqual(len(window.menu_buttons), len(MainWindow.MENU))
 
+    def test_backup_recovery_page_only_lists_unsupported_operations(self):
+        page = BackupRecoveryPage()
+        self.addCleanup(page.close)
+
+        self.assertEqual(page.operation_table.rowCount(), 6)
+        self.assertTrue(
+            all(
+                page.operation_table.item(row, 1).text()
+                == "BELUM TERSEDIA"
+                for row in range(page.operation_table.rowCount())
+            )
+        )
+        self.assertEqual(page.findChildren(QPushButton), [])
+        labels = [label.text() for label in page.findChildren(QLabel)]
+        self.assertTrue(
+            any("/health/ready" in label for label in labels)
+        )
+        self.assertIn(
+            "BACKUP DATABASE: BELUM DIDUKUNG UNIVERSAL API",
+            page.readiness_status.text(),
+        )
+
+    def test_developer_notifications_page_does_not_relabel_audit_as_notifications(self):
+        page = DeveloperNotificationsPage()
+        self.addCleanup(page.close)
+
+        self.assertEqual(page.capability_table.rowCount(), 8)
+        statuses = [
+            page.capability_table.item(row, 1).text()
+            for row in range(page.capability_table.rowCount())
+        ]
+        self.assertEqual(statuses[0], "BELUM TERSEDIA")
+        self.assertEqual(statuses[1], "TERSEDIA TERPISAH")
+        self.assertTrue(
+            all(status == "BELUM TERSEDIA" for status in statuses[2:])
+        )
+        self.assertIn(
+            "bukan notifikasi",
+            page.capability_table.item(1, 2).text().lower(),
+        )
+        self.assertEqual(page.findChildren(QPushButton), [])
+        self.assertIn("BELUM DIDUKUNG", page.readiness_status.text())
+
     def test_dashboard_displays_live_api_counts_and_latest_activity(self):
         class FakeApiClient:
             def list_tenants(self):
-                return [{"id": 31}, {"id": 32}]
+                return [
+                    {"id": 31, "status": "ACTIVE"},
+                    {"id": 32, "status": "INACTIVE"},
+                ]
 
-            def count_tenant_installations(self, tenant_id):
-                return {31: 4, 32: 7}[tenant_id]
+            def list_tenant_installations(self, tenant_id):
+                return [
+                    {"status": "ACTIVE"} for _ in range({31: 4, 32: 7}[tenant_id])
+                ] + [{"status": "REVOKED"}]
 
             def list_modules(self):
-                return [{"id": 1}, {"id": 2}, {"id": 3}]
+                return [
+                    {"id": 1, "is_active": True},
+                    {"id": 2, "is_active": True},
+                    {"id": 3, "is_active": False},
+                ]
 
             def list_recent_audit_logs(self):
                 return [
@@ -81,11 +145,13 @@ class DesktopApplicationTests(unittest.TestCase):
         self.addCleanup(page.close)
         page.show_dashboard_data(results[0])
 
-        self.assertEqual(page.stat_values["TOTAL TENANT"].text(), "2")
-        self.assertEqual(page.stat_values["INSTALASI"].text(), "11")
-        self.assertEqual(page.stat_values["MODUL SISTEM"].text(), "3")
+        self.assertEqual(page.stat_values["TENANT AKTIF"].text(), "1")
+        self.assertEqual(page.stat_values["INSTALASI AKTIF"].text(), "11")
+        self.assertEqual(page.stat_values["MODUL TERSEDIA"].text(), "2")
         self.assertEqual(page.stat_values["LISENSI AKTIF"].text(), "N/D")
         self.assertIn("TENANT_CREATED", page.activity_label.text())
+        self.assertIn("Waktu respons", page.stat_values["TENANT AKTIF"].toolTip())
+        self.assertEqual(page.database_status.text(), "DATABASE: N/D")
         self.assertEqual(
             page.data_status.text(),
             "DATA DASHBOARD: DIPERBARUI DARI UNIVERSAL API",
@@ -100,20 +166,197 @@ class DesktopApplicationTests(unittest.TestCase):
                 "counts": {
                     "tenants": None,
                     "installations": None,
-                    "modules": 2,
+                    "modules": None,
                 },
                 "errors": {
                     "tenants": "Akses ditolak.",
                     "installations": "Tenant gagal dimuat.",
+                    "modules": "Timeout.",
                 },
                 "activities": [],
+                "timings_ms": {
+                    "tenants": 12.5,
+                    "installations": 0.0,
+                    "modules": 8000.0,
+                    "activity": 1.0,
+                },
             }
         )
 
-        self.assertEqual(page.stat_values["TOTAL TENANT"].text(), "Gagal")
-        self.assertEqual(page.stat_values["INSTALASI"].text(), "Gagal")
-        self.assertEqual(page.stat_values["MODUL SISTEM"].text(), "2")
+        self.assertEqual(page.stat_values["TENANT AKTIF"].text(), "Gagal")
+        self.assertEqual(page.stat_values["INSTALASI AKTIF"].text(), "Gagal")
+        self.assertEqual(page.stat_values["MODUL TERSEDIA"].text(), "Gagal")
         self.assertIn("Akses ditolak", page.data_status.toolTip())
+        self.assertIn("8000.00 ms", page.stat_values["MODUL TERSEDIA"].toolTip())
+
+    def test_connection_check_reports_healthy_status_and_response_time(self):
+        class FakeApiClient:
+            def check_connection(self):
+                return {"status": "RUNNING"}
+
+            def check_database_readiness(self):
+                return {"status": "ONLINE", "database": "CONNECTED"}
+
+        results = []
+        worker = DashboardMonitoringWorker(FakeApiClient())
+        worker.checked.connect(results.append)
+        worker.run()
+
+        api = results[0]["api"]
+        database = results[0]["database"]
+        self.assertTrue(api["connected"])
+        self.assertEqual(api["message"], "API: TERHUBUNG")
+        self.assertGreaterEqual(api["response_ms"], 0)
+        self.assertTrue(api["checked_at"])
+        self.assertEqual(database["status"], "ONLINE")
+        self.assertGreaterEqual(database["response_ms"], 0)
+        self.assertTrue(database["checked_at"])
+
+    def test_connection_check_reports_failed_health_endpoint_as_offline(self):
+        class FakeApiClient:
+            def check_connection(self):
+                raise ApiError("Health endpoint returned HTTP 503.")
+
+            def check_database_readiness(self):
+                return {"status": "ONLINE", "database": "CONNECTED"}
+
+        results = []
+        worker = DashboardMonitoringWorker(FakeApiClient())
+        worker.checked.connect(results.append)
+        worker.run()
+
+        api = results[0]["api"]
+        self.assertFalse(api["connected"])
+        self.assertIn("HTTP 503", api["message"])
+        self.assertGreaterEqual(api["response_ms"], 0)
+        self.assertTrue(api["checked_at"])
+
+    def test_connection_check_reports_database_readiness_503_as_offline(self):
+        class FakeApiClient:
+            def check_connection(self):
+                return {"status": "RUNNING"}
+
+            def check_database_readiness(self):
+                raise ApiError(
+                    "Permintaan API gagal (HTTP 503).",
+                    status_code=503,
+                )
+
+        results = []
+        worker = DashboardMonitoringWorker(FakeApiClient())
+        worker.checked.connect(results.append)
+        worker.run()
+
+        self.assertTrue(results[0]["api"]["connected"])
+        self.assertEqual(results[0]["database"]["status"], "OFFLINE")
+        self.assertIn("HTTP 503", results[0]["database"]["message"])
+
+    def test_connection_check_shows_database_not_determined_if_endpoint_missing(self):
+        class FakeApiClient:
+            def check_connection(self):
+                return {"status": "RUNNING"}
+
+            def check_database_readiness(self):
+                raise ApiError(
+                    "Permintaan API gagal (HTTP 404).",
+                    status_code=404,
+                )
+
+        results = []
+        worker = DashboardMonitoringWorker(FakeApiClient())
+        worker.checked.connect(results.append)
+        worker.run()
+
+        self.assertTrue(results[0]["api"]["connected"])
+        self.assertEqual(results[0]["database"]["status"], "N/D")
+        self.assertIn("tidak tersedia", results[0]["database"]["message"])
+
+    def test_connection_check_reports_timeout_as_offline_with_elapsed_time(self):
+        class FakeApiClient:
+            def check_connection(self):
+                raise ApiError("Request timed out.")
+
+            def check_database_readiness(self):
+                return {"status": "ONLINE", "database": "CONNECTED"}
+
+        results = []
+        worker = DashboardMonitoringWorker(FakeApiClient())
+        worker.checked.connect(results.append)
+        with patch(
+            "main.time.perf_counter",
+            side_effect=[2.0, 10.0, 10.0, 10.05],
+        ):
+            worker.run()
+
+        api = results[0]["api"]
+        self.assertFalse(api["connected"])
+        self.assertIn("timed out", api["message"])
+        self.assertEqual(api["response_ms"], 8000.0)
+
+    def test_dashboard_shows_monitoring_data_unavailable_as_not_determined(self):
+        page = DashboardPage()
+        self.addCleanup(page.close)
+
+        self.assertEqual(page.database_status.text(), "DATABASE: N/D")
+        self.assertIn("GET /health/ready", page.database_status.toolTip())
+        page.show_api_health(
+            False,
+            "Tidak dapat terhubung ke Universal API.",
+            8000.0,
+            "2026-11-17T11:00:00+07:00",
+            "N/D",
+            "Endpoint readiness tidak tersedia.",
+            12.0,
+            "2026-11-17T11:00:00+07:00",
+        )
+
+        self.assertEqual(page.api_status.text(), "UNIVERSAL API: OFFLINE")
+        self.assertEqual(page.api_response_time.text(), "Waktu respons: 8000.00 ms")
+        self.assertEqual(
+            page.last_health_check.text(),
+            "Pemeriksaan terakhir: 2026-11-17T11:00:00+07:00",
+        )
+        self.assertEqual(page.database_status.text(), "DATABASE: N/D")
+        self.assertEqual(
+            page.database_response_time.text(),
+            "Waktu respons database: 12.00 ms",
+        )
+
+    def test_dashboard_marks_database_online_only_after_readiness_success(self):
+        page = DashboardPage()
+        self.addCleanup(page.close)
+
+        page.show_api_health(
+            True,
+            "API: TERHUBUNG",
+            5.0,
+            "2026-11-17T11:00:00+07:00",
+            "ONLINE",
+            "Database readiness succeeded.",
+            8.0,
+            "2026-11-17T11:00:00+07:00",
+        )
+        self.assertEqual(page.database_status.text(), "DATABASE: ONLINE")
+
+        page.show_database_readiness(
+            "OFFLINE",
+            "Database readiness returned HTTP 503.",
+            9.0,
+            "2026-11-17T11:00:30+07:00",
+        )
+        self.assertEqual(page.database_status.text(), "DATABASE: OFFLINE")
+
+    def test_dashboard_manual_refresh_requests_monitoring_check(self):
+        page = DashboardPage(Mock())
+        self.addCleanup(page.close)
+        checks = []
+        page.health_check_requested.connect(lambda: checks.append(True))
+
+        with patch.object(page, "load_dashboard") as load_dashboard:
+            page.refresh_button.click()
+
+        load_dashboard.assert_called_once_with()
+        self.assertEqual(checks, [True])
 
     def test_license_page_uses_api_module_assignment_without_fake_licenses(self):
         class FakeApiClient:
@@ -527,13 +770,234 @@ class DesktopApplicationTests(unittest.TestCase):
         self.assertTrue(page.table.isRowHidden(0))
         self.assertFalse(page.table.isRowHidden(1))
 
+    def test_audit_log_page_displays_details_filters_and_paginates_api_data(self):
+        logs = [
+            {
+                "id": 101,
+                "tenant_id": 31,
+                "actor_type": "DEVELOPER",
+                "actor_id": 7,
+                "action": "TENANT_CREATED",
+                "entity": "Tenant",
+                "entity_id": "31",
+                "details": {
+                    "result": "success",
+                    "summary": "Tenant created",
+                },
+                "created_at": "2026-11-16T08:30:00+00:00",
+            },
+            {
+                "id": 102,
+                "tenant_id": 31,
+                "actor_type": "TENANT",
+                "actor_id": 9,
+                "action": "MEMBER_UPDATED",
+                "entity": "Member",
+                "entity_id": "12",
+                "details": {"result": "updated"},
+                "created_at": "2026-11-17T09:30:00+00:00",
+            },
+            {
+                "id": 103,
+                "tenant_id": None,
+                "actor_type": "SYSTEM",
+                "actor_id": None,
+                "action": "LOGIN_FAILED",
+                "entity": "DeveloperSession",
+                "entity_id": None,
+                "details": None,
+                "created_at": "2026-11-18T10:30:00+00:00",
+            },
+        ]
+
+        class FakeApiClient:
+            def __init__(self):
+                self.calls = []
+
+            def list_audit_logs(self, limit, offset):
+                self.calls.append((limit, offset))
+                items = logs[offset : offset + limit]
+                return {"items": items, "limit": limit, "offset": offset}
+
+        api_client = FakeApiClient()
+        page = AuditLogPage(api_client)
+        page.PAGE_SIZE = 2
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+
+        page.load_page()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(api_client.calls, [(2, 0)])
+        self.assertEqual(page.table.rowCount(), 2)
+        self.assertEqual(page.table.item(0, 2).text(), "DEVELOPER #7")
+        self.assertEqual(page.table.item(0, 3).text(), "TENANT_CREATED")
+        self.assertEqual(page.table.item(0, 4).text(), "Tenant #31")
+        self.assertIn("success", page.table.item(0, 5).text())
+        self.assertEqual(
+            page.data_status.text(),
+            "AUDIT LOG: 2 DIMUAT (OFFSET 0); TOTAL TIDAK DISEDIAKAN API",
+        )
+        self.assertIn("halaman yang sedang dimuat", page.filter_limitation.text())
+        self.assertTrue(page.next_button.isEnabled())
+        self.assertIsNone(page.add_button)
+        self.assertIsNone(page.edit_button)
+
+        page.actor_filter.setCurrentIndex(
+            page.actor_filter.findData("TENANT #9")
+        )
+        self.assertTrue(page.table.isRowHidden(0))
+        self.assertFalse(page.table.isRowHidden(1))
+        page.actor_filter.setCurrentIndex(0)
+        page.date_from.setText("2026-11-17")
+        self.assertTrue(page.table.isRowHidden(0))
+        self.assertFalse(page.table.isRowHidden(1))
+        page.date_from.clear()
+        page.status_filter.setCurrentText("MEMBER_UPDATED")
+        self.assertTrue(page.table.isRowHidden(0))
+        self.assertFalse(page.table.isRowHidden(1))
+        page.status_filter.setCurrentText("Semua")
+        page.search.setText("DEVELOPER #7")
+        self.assertFalse(page.table.isRowHidden(0))
+        self.assertTrue(page.table.isRowHidden(1))
+        page.search.clear()
+        page.table.selectRow(0)
+        self.assertTrue(page.detail_button.isEnabled())
+
+        with patch("main.QMessageBox.exec"):
+            page.show_selected_details()
+        detail_dialog = page.findChildren(QMessageBox)[-1]
+        self.assertIn("ID log: 101", detail_dialog.text())
+        self.assertIn("Aktivitas: TENANT_CREATED", detail_dialog.text())
+        self.assertIn('"summary": "Tenant created"', detail_dialog.text())
+
+        page.next_button.click()
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(api_client.calls, [(2, 0), (2, 2)])
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 3).text(), "LOGIN_FAILED")
+        self.assertFalse(page.next_button.isEnabled())
+        self.assertTrue(page.previous_button.isEnabled())
+
+        page.previous_button.click()
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(api_client.calls[-1], (2, 0))
+
+    def test_audit_log_page_surfaces_api_permission_errors(self):
+        class FakeApiClient:
+            def __init__(self):
+                self.requested_page = None
+
+            def list_audit_logs(self, limit, offset):
+                self.requested_page = (limit, offset)
+                raise ApiError("Akses ditolak: auth.audit.read.")
+
+        api_client = FakeApiClient()
+        page = AuditLogPage(api_client)
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+
+        page.load_page()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertIn("GAGAL DIMUAT", page.data_status.text())
+        self.assertIn("auth.audit.read", page.data_status.text())
+        self.assertIn("tidak dapat dimuat", page.empty_label.text())
+        self.assertEqual(api_client.requested_page, (50, 0))
+
     def test_configuration_rejects_malformed_api_url(self):
         page = ConfigurationPage()
         self.addCleanup(page.close)
         page.api_url.setText("not-a-url")
 
         self.assertFalse(page.save_settings())
-        self.assertIn("URL API", page.result.text())
+        self.assertIn("URL API", page.settings_notice.text())
+
+    def test_configuration_saves_local_identity_appearance_and_window_size(self):
+        stored_values = {}
+        settings = Mock()
+        settings.value.side_effect = lambda key, default=None: stored_values.get(
+            key, default
+        )
+        settings.setValue.side_effect = (
+            lambda key, value: stored_values.__setitem__(key, value)
+        )
+        settings.status.return_value = QSettings.Status.NoError
+        with patch("main.settings_store", return_value=settings):
+            window = MainWindow()
+            self.addCleanup(window.close)
+            page = window.page_by_key["configuration"]
+            page.app_name.setText("Desktop Test")
+            page.api_url.setText("https://api.example.test")
+            page.theme.setCurrentIndex(page.theme.findData("dark"))
+            page.window_size.setCurrentIndex(
+                page.window_size.findData("1440x900")
+            )
+            page.primary_color.setText("#521020")
+            page.accent_color.setText("#DDBB44")
+
+            self.assertTrue(page.save_settings())
+
+        self.assertEqual(stored_values["branding/app_name"], "Desktop Test")
+        self.assertEqual(
+            stored_values["api/base_url"], "https://api.example.test"
+        )
+        self.assertEqual(stored_values["appearance/theme"], "dark")
+        self.assertEqual(
+            stored_values["operational/window_size"], "1440x900"
+        )
+        self.assertEqual(stored_values["branding/primary_color"], "#521020")
+        self.assertEqual(stored_values["branding/accent_color"], "#ddbb44")
+        self.assertIn("berhasil disimpan", page.settings_notice.text())
+        self.assertEqual(window.windowTitle(), "Desktop Test")
+        self.assertEqual((window.width(), window.height()), (1440, 900))
+        self.assertIn("#1E1E1E", window.styleSheet())
+
+    def test_configuration_connection_probe_uses_unauthed_health_endpoint(self):
+        page = ConfigurationPage()
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_connection_test)
+        page.api_url.setText("https://api.example.test")
+
+        with patch(
+            "main.ApiClient._send",
+            autospec=True,
+            return_value={"status": "RUNNING"},
+        ) as send:
+            page.test_connection()
+            page.wait_for_connection_test()
+            self.app.processEvents()
+
+        api_client = send.call_args.args[0]
+        self.assertEqual(api_client.base_url, "https://api.example.test")
+        self.assertEqual(send.call_args.args[1:], ("GET", "/health/live"))
+        self.assertNotIn("access_token", send.call_args.kwargs)
+        self.assertEqual(
+            page.connection_status.text(),
+            "Koneksi Universal API: TERHUBUNG",
+        )
+
+    def test_configuration_connection_failure_is_visible(self):
+        page = ConfigurationPage()
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_connection_test)
+        page.api_url.setText("https://api.example.test")
+
+        with patch(
+            "main.ApiClient._send",
+            autospec=True,
+            side_effect=ApiError("API tidak tersedia."),
+        ):
+            page.test_connection()
+            page.wait_for_connection_test()
+            self.app.processEvents()
+
+        self.assertIn("GAGAL", page.connection_status.text())
+        self.assertIn("API tidak tersedia", page.connection_status.text())
 
     def test_login_without_password_change_requirement_skips_change_page(self):
         user = {"username": "developer", "must_change_password": False}
@@ -856,6 +1320,189 @@ class DesktopApplicationTests(unittest.TestCase):
         page.wait_for_load()
         self.app.processEvents()
         self.assertEqual(page.data_status.text(), "DATA TENANT: 0 DIMUAT DARI API")
+
+
+    def test_developer_dialogs_mask_password_and_do_not_assign_roles_implicitly(self):
+        roles = [
+            {
+                "id": 1,
+                "code": "developer_admin",
+                "name": "Developer Admin",
+                "is_active": True,
+            },
+            {
+                "id": 2,
+                "code": "developer_support",
+                "name": "Developer Support",
+                "is_active": True,
+            },
+        ]
+        account_dialog = DeveloperAccountDialog(roles=roles)
+        self.addCleanup(account_dialog.close)
+        self.assertEqual(
+            account_dialog.password.echoMode(),
+            QLineEdit.EchoMode.Password,
+        )
+        self.assertEqual(account_dialog.selected_role_codes(), [])
+        account_dialog.username.setText("new.developer")
+        account_dialog.full_name.setText("New Developer")
+        account_dialog.password.setText("initial-secure-password")
+        account_dialog.confirm_password.setText("initial-secure-password")
+        self.assertTrue(account_dialog.submit_form())
+        self.assertEqual(account_dialog.values()["role_codes"], [])
+        account_dialog.clear_sensitive_inputs()
+        self.assertEqual(account_dialog.password.text(), "")
+        self.assertEqual(account_dialog.confirm_password.text(), "")
+
+        password_dialog = DeveloperPasswordDialog("new.developer")
+        self.addCleanup(password_dialog.close)
+        self.assertEqual(
+            password_dialog.password.echoMode(),
+            QLineEdit.EchoMode.Password,
+        )
+        password_dialog.password.setText("replacement-password")
+        password_dialog.confirm_password.setText("replacement-password")
+        self.assertTrue(password_dialog.submit_form())
+        password_dialog.clear_passwords()
+        self.assertEqual(password_dialog.password.text(), "")
+        self.assertEqual(password_dialog.confirm_password.text(), "")
+
+        selection = DeveloperSelectionDialog(
+            "Role akun", roles, selected_codes=[]
+        )
+        self.addCleanup(selection.close)
+        self.assertEqual(selection.selected_codes(), [])
+
+    def test_developer_page_shows_api_accounts_and_updates_status(self):
+        account = {
+            "id": 17,
+            "username": "developer.one",
+            "full_name": "Developer One",
+            "is_active": True,
+            "roles": [],
+            "created_at": "2026-11-17T00:00:00+00:00",
+            "updated_at": "2026-11-17T00:00:00+00:00",
+        }
+
+        class FakeApiClient:
+            def __init__(self):
+                self.account = dict(account)
+                self.status_calls = []
+
+            def list_developer_accounts(self, limit, offset):
+                return {
+                    "items": [dict(self.account)],
+                    "limit": limit,
+                    "offset": offset,
+                }
+
+            def list_developer_roles(self):
+                return [
+                    {
+                        "id": 1,
+                        "code": "developer_admin",
+                        "name": "Developer Admin",
+                        "is_active": True,
+                        "permissions": ["auth.developers.manage"],
+                    },
+                    {
+                        "id": 2,
+                        "code": "developer_support",
+                        "name": "Developer Support",
+                        "is_active": True,
+                        "permissions": ["auth.audit.read"],
+                    },
+                ]
+
+            def list_developer_permissions(self):
+                return [
+                    {
+                        "code": "auth.developers.manage",
+                        "name": "Manage developers",
+                        "module": "auth",
+                    }
+                ]
+
+            def set_developer_account_active(self, user_id, is_active):
+                self.status_calls.append((user_id, is_active))
+                self.account["is_active"] = is_active
+                return dict(self.account)
+
+        api_client = FakeApiClient()
+        page = DeveloperPage(api_client)
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+
+        page.load_page()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 2).text(), "developer.one")
+        self.assertEqual(page.table.item(0, 4).text(), "—")
+        self.assertEqual(page.table.item(0, 5).text(), "ACTIVE")
+        self.assertIn("auth.developers.manage", page.capability_note.text())
+
+        detail_text = []
+        with patch.object(
+            QMessageBox,
+            "setText",
+            new=lambda _dialog, text: detail_text.append(text),
+        ), patch("main.QMessageBox.exec"):
+            page.show_details(0, 0)
+        self.assertIn("Username: developer.one", detail_text[0])
+        self.assertNotIn("password", detail_text[0].lower())
+        self.assertNotIn("token", detail_text[0].lower())
+
+        page.table.selectRow(0)
+        self.assertTrue(page.status_button.isEnabled())
+        with patch(
+            "main.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            page.toggle_status()
+        page.wait_for_load()
+        self.app.processEvents()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(api_client.status_calls, [(17, False)])
+        self.assertEqual(page.table.item(0, 5).text(), "INACTIVE")
+
+    def test_developer_role_manager_protects_system_admin_permissions(self):
+        roles = [
+            {
+                "id": 1,
+                "code": "developer_admin",
+                "name": "Developer Admin",
+                "is_active": True,
+                "permissions": ["auth.roles.manage"],
+            },
+            {
+                "id": 2,
+                "code": "developer_support",
+                "name": "Developer Support",
+                "is_active": True,
+                "permissions": ["auth.audit.read"],
+            },
+        ]
+        dialog = DeveloperRoleManagerDialog(
+            object(),
+            roles,
+            [
+                {
+                    "code": "auth.audit.read",
+                    "name": "Read audit",
+                    "module": "auth",
+                }
+            ],
+        )
+        self.addCleanup(dialog.close)
+
+        dialog.table.selectRow(0)
+        self.assertFalse(dialog.permissions_button.isEnabled())
+        dialog.table.selectRow(1)
+        self.assertTrue(dialog.permissions_button.isEnabled())
 
 
 if __name__ == "__main__":

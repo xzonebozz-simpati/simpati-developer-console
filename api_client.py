@@ -209,6 +209,17 @@ class ApiClient:
             raise ApiError("Universal API merespons, tetapi belum berstatus aktif.")
         return result
 
+    def check_database_readiness(self):
+        result = self._send("GET", "/health/ready")
+        if (
+            result.get("status") != "ONLINE"
+            or result.get("database") != "CONNECTED"
+        ):
+            raise ApiError(
+                "Universal API tidak mengonfirmasi kesiapan database."
+            )
+        return result
+
     def list_tenants(self):
         tenants = []
         offset = 0
@@ -603,10 +614,19 @@ class ApiClient:
             )
         return total
 
-    def list_recent_audit_logs(self, limit=5):
+    def list_audit_logs(self, limit=50, offset=0, tenant_id=None):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ApiError("Jumlah audit log yang diminta tidak valid.")
-        query = urlencode({"limit": limit, "offset": 0})
+        if type(offset) is not int or offset < 0:
+            raise ApiError("Offset audit log tidak valid.")
+        if tenant_id is not None and (
+            type(tenant_id) is not int or tenant_id < 1
+        ):
+            raise ApiError("ID Tenant untuk audit log tidak valid.")
+        params = {"limit": limit, "offset": offset}
+        if tenant_id is not None:
+            params["tenant_id"] = tenant_id
+        query = urlencode(params)
         response = self.request(
             "GET", f"/auth/audit-logs?{query}", authenticated=True
         )
@@ -616,18 +636,412 @@ class ApiClient:
             or len(logs) > limit
             or any(
                 not isinstance(log, dict)
+                or any(
+                    key not in log
+                    for key in (
+                        "id",
+                        "tenant_id",
+                        "actor_type",
+                        "actor_id",
+                        "action",
+                        "entity",
+                        "entity_id",
+                        "details",
+                        "created_at",
+                    )
+                )
+                or type(log.get("id")) is not int
+                or (
+                    log.get("tenant_id") is not None
+                    and type(log.get("tenant_id")) is not int
+                )
+                or log.get("actor_type")
+                not in {"DEVELOPER", "TENANT", "SYSTEM"}
+                or (
+                    log.get("actor_id") is not None
+                    and type(log.get("actor_id")) is not int
+                )
                 or not isinstance(log.get("action"), str)
                 or not isinstance(log.get("entity"), str)
+                or (
+                    log.get("entity_id") is not None
+                    and not isinstance(log.get("entity_id"), str)
+                )
+                or (
+                    log.get("details") is not None
+                    and not isinstance(log.get("details"), dict)
+                )
                 or not isinstance(log.get("created_at"), str)
                 for log in logs
             )
+            or type(response.get("limit")) is not int
             or response.get("limit") != limit
-            or response.get("offset") != 0
+            or type(response.get("offset")) is not int
+            or response.get("offset") != offset
         ):
             raise ApiError(
                 "Respons audit log dari Universal API tidak valid."
             )
-        return logs
+        return response
+
+    def list_recent_audit_logs(self, limit=5):
+        return self.list_audit_logs(limit=limit, offset=0)["items"]
+
+    @staticmethod
+    def _validate_developer_id(user_id):
+        if type(user_id) is not int or user_id < 1:
+            raise ApiError("ID akun Developer tidak valid.")
+
+    @staticmethod
+    def _validate_developer_account(account):
+        sensitive_fields = {
+            "password",
+            "password_hash",
+            "access_token",
+            "refresh_token",
+        }
+        if (
+            not isinstance(account, dict)
+            or sensitive_fields.intersection(account)
+            or type(account.get("id")) is not int
+            or not isinstance(account.get("username"), str)
+            or not isinstance(account.get("full_name"), str)
+            or type(account.get("is_active")) is not bool
+        ):
+            raise ApiError(
+                "Respons akun Developer dari Universal API tidak valid."
+            )
+        return account
+
+    @staticmethod
+    def _validate_role_codes(role_codes):
+        if (
+            not isinstance(role_codes, list)
+            or any(
+                not isinstance(code, str)
+                or not re.fullmatch(r"[a-z0-9._-]{2,50}", code)
+                for code in role_codes
+            )
+            or len(role_codes) != len(set(role_codes))
+        ):
+            raise ApiError("Daftar role Developer tidak valid.")
+        return role_codes
+
+    @staticmethod
+    def _validate_permission_codes(permission_codes):
+        if (
+            not isinstance(permission_codes, list)
+            or any(
+                not isinstance(code, str)
+                or not re.fullmatch(r"[a-z][a-z0-9._-]{1,99}", code)
+                for code in permission_codes
+            )
+            or len(permission_codes) != len(set(permission_codes))
+        ):
+            raise ApiError("Daftar permission Developer tidak valid.")
+        return permission_codes
+
+    def list_developer_accounts(self, limit=50, offset=0):
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ApiError("Jumlah akun Developer yang diminta tidak valid.")
+        if type(offset) is not int or offset < 0:
+            raise ApiError("Offset akun Developer tidak valid.")
+        query = urlencode({"limit": limit, "offset": offset})
+        response = self.request(
+            "GET", f"/auth/developers?{query}", authenticated=True
+        )
+        accounts = response.get("items") if isinstance(response, dict) else None
+        if (
+            not isinstance(accounts, list)
+            or len(accounts) > limit
+            or any(
+                not isinstance(account, dict)
+                or "roles" not in account
+                or not isinstance(account.get("roles"), list)
+                or any(not isinstance(role, str) for role in account["roles"])
+                or not isinstance(account.get("created_at"), str)
+                or not isinstance(account.get("updated_at"), str)
+                for account in accounts
+            )
+            or response.get("limit") != limit
+            or response.get("offset") != offset
+        ):
+            raise ApiError(
+                "Respons daftar akun Developer dari Universal API tidak valid."
+            )
+        for account in accounts:
+            self._validate_developer_account(account)
+        return response
+
+    def create_developer_account(
+        self, username, password, full_name, role_codes=None
+    ):
+        if not isinstance(username, str):
+            raise ApiError("Username Developer tidak valid.")
+        username = username.strip().lower()
+        if not re.fullmatch(r"[a-zA-Z0-9._-]{3,100}", username):
+            raise ApiError("Username Developer harus terdiri dari 3–100 karakter.")
+        if not isinstance(full_name, str) or not full_name.strip():
+            raise ApiError("Nama lengkap Developer wajib diisi.")
+        full_name = full_name.strip()
+        if len(full_name) > 200:
+            raise ApiError("Nama lengkap Developer maksimal 200 karakter.")
+        if not isinstance(password, str) or not 12 <= len(password) <= 256:
+            raise ApiError("Password harus terdiri dari 12–256 karakter.")
+        if role_codes is None:
+            role_codes = []
+        role_codes = self._validate_role_codes(role_codes)
+        response = self.request(
+            "POST",
+            "/auth/developer/register",
+            {
+                "username": username,
+                "password": password,
+                "full_name": full_name,
+                "role_codes": role_codes,
+            },
+            authenticated=True,
+        )
+        account = self._validate_developer_account(response)
+        if (
+            account["username"] != username
+            or account["full_name"] != full_name
+            or account.get("role_codes") != sorted(role_codes)
+        ):
+            raise ApiError(
+                "Respons pembuatan akun Developer dari Universal API tidak "
+                "valid."
+            )
+        return account
+
+    def update_developer_account(self, user_id, full_name):
+        self._validate_developer_id(user_id)
+        if not isinstance(full_name, str) or not full_name.strip():
+            raise ApiError("Nama lengkap Developer wajib diisi.")
+        full_name = full_name.strip()
+        if len(full_name) > 200:
+            raise ApiError("Nama lengkap Developer maksimal 200 karakter.")
+        response = self.request(
+            "PATCH",
+            f"/auth/developers/{user_id}",
+            {"full_name": full_name},
+            authenticated=True,
+        )
+        account = self._validate_developer_account(response)
+        if account["id"] != user_id or account["full_name"] != full_name:
+            raise ApiError(
+                "Respons perubahan akun Developer dari Universal API tidak "
+                "valid."
+            )
+        return account
+
+    def set_developer_account_active(self, user_id, is_active):
+        self._validate_developer_id(user_id)
+        if type(is_active) is not bool:
+            raise ApiError("Status akun Developer tidak valid.")
+        response = self.request(
+            "PATCH",
+            f"/auth/developers/{user_id}",
+            {"is_active": is_active},
+            authenticated=True,
+        )
+        account = self._validate_developer_account(response)
+        if account["id"] != user_id or account["is_active"] != is_active:
+            raise ApiError(
+                "Respons perubahan status akun Developer dari Universal API "
+                "tidak valid."
+            )
+        return account
+
+    def reset_developer_password(self, user_id, password):
+        self._validate_developer_id(user_id)
+        if not isinstance(password, str) or not 12 <= len(password) <= 256:
+            raise ApiError("Password harus terdiri dari 12–256 karakter.")
+        response = self.request(
+            "PATCH",
+            f"/auth/developers/{user_id}",
+            {"password": password},
+            authenticated=True,
+        )
+        account = self._validate_developer_account(response)
+        if account["id"] != user_id:
+            raise ApiError(
+                "Respons reset password Developer dari Universal API tidak "
+                "valid."
+            )
+        return account
+
+    def assign_developer_roles(self, user_id, role_codes):
+        self._validate_developer_id(user_id)
+        role_codes = self._validate_role_codes(role_codes)
+        response = self.request(
+            "PUT",
+            f"/auth/developers/{user_id}/roles",
+            {"role_codes": role_codes},
+            authenticated=True,
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("user_id") != user_id
+            or response.get("role_codes") != sorted(role_codes)
+        ):
+            raise ApiError(
+                "Respons assignment role Developer dari Universal API tidak "
+                "valid."
+            )
+        return response
+
+    def list_developer_roles(self):
+        roles = self.request(
+            "GET", "/auth/developer-roles", authenticated=True
+        )
+        if not isinstance(roles, list) or any(
+            not isinstance(role, dict)
+            or type(role.get("id")) is not int
+            or not isinstance(role.get("code"), str)
+            or not isinstance(role.get("name"), str)
+            or (
+                role.get("description") is not None
+                and not isinstance(role.get("description"), str)
+            )
+            or type(role.get("is_active")) is not bool
+            or not isinstance(role.get("permissions"), list)
+            or any(
+                not isinstance(permission, str)
+                for permission in role["permissions"]
+            )
+            for role in roles
+        ):
+            raise ApiError(
+                "Respons daftar role Developer dari Universal API tidak valid."
+            )
+        return roles
+
+    def list_developer_permissions(self):
+        permissions = self.request(
+            "GET", "/auth/permissions", authenticated=True
+        )
+        if not isinstance(permissions, list) or any(
+            not isinstance(permission, dict)
+            or not isinstance(permission.get("code"), str)
+            or not isinstance(permission.get("name"), str)
+            or not isinstance(permission.get("module"), str)
+            for permission in permissions
+        ):
+            raise ApiError(
+                "Respons katalog permission Developer dari Universal API "
+                "tidak valid."
+            )
+        return permissions
+
+    def create_developer_role(
+        self, code, name, description=None, permission_codes=None
+    ):
+        if not isinstance(code, str):
+            raise ApiError("Kode role Developer tidak valid.")
+        code = code.strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{2,50}", code):
+            raise ApiError("Kode role Developer tidak valid.")
+        if code == "developer_admin":
+            raise ApiError("Role developer_admin dikelola oleh sistem.")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("Nama role Developer wajib diisi.")
+        name = name.strip()
+        if len(name) > 100:
+            raise ApiError("Nama role Developer maksimal 100 karakter.")
+        if description is not None and not isinstance(description, str):
+            raise ApiError("Deskripsi role Developer tidak valid.")
+        description = description.strip() if description else None
+        if description and len(description) > 2000:
+            raise ApiError("Deskripsi role Developer maksimal 2000 karakter.")
+        if permission_codes is None:
+            permission_codes = []
+        permission_codes = self._validate_permission_codes(permission_codes)
+        response = self.request(
+            "POST",
+            "/auth/developer-roles",
+            {
+                "code": code,
+                "name": name,
+                "description": description,
+                "permission_codes": permission_codes,
+            },
+            authenticated=True,
+        )
+        if (
+            not isinstance(response, dict)
+            or type(response.get("id")) is not int
+            or response.get("code") != code
+            or response.get("name") != name
+            or response.get("permissions") != sorted(permission_codes)
+        ):
+            raise ApiError(
+                "Respons pembuatan role Developer dari Universal API tidak "
+                "valid."
+            )
+        return response
+
+    def update_developer_role(
+        self, role_id, name, description, is_active
+    ):
+        if type(role_id) is not int or role_id < 1:
+            raise ApiError("ID role Developer tidak valid.")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("Nama role Developer wajib diisi.")
+        name = name.strip()
+        if len(name) > 100:
+            raise ApiError("Nama role Developer maksimal 100 karakter.")
+        if description is not None and not isinstance(description, str):
+            raise ApiError("Deskripsi role Developer tidak valid.")
+        description = description.strip() if description else None
+        if description and len(description) > 2000:
+            raise ApiError("Deskripsi role Developer maksimal 2000 karakter.")
+        if type(is_active) is not bool:
+            raise ApiError("Status role Developer tidak valid.")
+        response = self.request(
+            "PATCH",
+            f"/auth/developer-roles/{role_id}",
+            {
+                "name": name,
+                "description": description,
+                "is_active": is_active,
+            },
+            authenticated=True,
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("id") != role_id
+            or response.get("name") != name
+            or response.get("description") != description
+            or response.get("is_active") is not is_active
+            or not isinstance(response.get("code"), str)
+        ):
+            raise ApiError(
+                "Respons perubahan role Developer dari Universal API tidak "
+                "valid."
+            )
+        return response
+
+    def set_developer_role_permissions(self, role_id, permission_codes):
+        if type(role_id) is not int or role_id < 1:
+            raise ApiError("ID role Developer tidak valid.")
+        permission_codes = self._validate_permission_codes(permission_codes)
+        response = self.request(
+            "PUT",
+            f"/auth/developer-roles/{role_id}/permissions",
+            {"permission_codes": permission_codes},
+            authenticated=True,
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("role_id") != role_id
+            or response.get("permissions") != sorted(permission_codes)
+        ):
+            raise ApiError(
+                "Respons perubahan permission role Developer dari Universal "
+                "API tidak valid."
+            )
+        return response
 
     @staticmethod
     def _validate_module_request(tenant_id, module_code):
