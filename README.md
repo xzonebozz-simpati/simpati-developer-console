@@ -7,6 +7,8 @@ tidak mengakses database atau License Manager secara langsung.
 
 ## Integrasi Universal API
 
+- Semua request mengidentifikasi klien secara eksplisit sebagai
+  `SIMPATI-Developer-Desktop`; Desktop tidak menyamar sebagai browser.
 - Login Developer memakai `POST /auth/developer/login` dengan
   `username` dan `password`.
 - Jika respons login berisi `user.must_change_password=true`, Desktop

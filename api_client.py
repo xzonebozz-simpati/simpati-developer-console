@@ -91,6 +91,7 @@ class SecureTokenStore:
 
 class ApiClient:
     TIMEOUT_SECONDS = 8
+    USER_AGENT = "SIMPATI-Developer-Desktop"
     API_SERVICE_PATH = "/health/live"
     TENANT_PAGE_SIZE = 100
     INSTALLATION_PAGE_SIZE = 100
@@ -149,7 +150,10 @@ class ApiClient:
             if payload is not None
             else None
         )
-        headers = {"Accept": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": self.USER_AGENT,
+        }
         if body is not None:
             headers["Content-Type"] = "application/json"
         if access_token:

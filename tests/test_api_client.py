@@ -45,6 +45,20 @@ class ApiClientTests(unittest.TestCase):
         self.store = MemoryTokenStore()
         self.client = ApiClient("https://api.example.test", self.store)
 
+    @patch("api_client.urlopen")
+    def test_requests_identify_the_desktop_client(self, urlopen):
+        urlopen.return_value = FakeResponse({"status": "RUNNING"})
+
+        self.client.check_connection()
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("User-agent"), ApiClient.USER_AGENT
+        )
+        self.assertEqual(
+            request.get_header("Accept"), "application/json"
+        )
+
     def test_base_url_allows_local_http_but_rejects_remote_http(self):
         self.assertEqual(
             ApiClient.validate_base_url("http://127.0.0.1:8000"),
