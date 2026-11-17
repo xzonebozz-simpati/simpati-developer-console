@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -412,9 +413,65 @@ class ConnectionCheckWorker(QThread):
             self.checked.emit(True, "API: TERHUBUNG")
 
 
-class DashboardPage(QWidget):
-    def __init__(self):
+class DashboardLoadWorker(QThread):
+    loaded = Signal(object)
+
+    def __init__(self, api_client):
         super().__init__()
+        self.api_client = api_client
+
+    def run(self):
+        counts = {
+            "tenants": None,
+            "installations": None,
+            "modules": None,
+        }
+        errors = {}
+        tenants = None
+
+        try:
+            tenants = self.api_client.list_tenants()
+            counts["tenants"] = len(tenants)
+        except ApiError as exc:
+            errors["tenants"] = str(exc)
+
+        if tenants is None:
+            errors["installations"] = (
+                "Jumlah instalasi tidak dapat dihitung karena daftar Tenant "
+                "gagal dimuat."
+            )
+        else:
+            try:
+                counts["installations"] = sum(
+                    self.api_client.count_tenant_installations(
+                        tenant["id"]
+                    )
+                    for tenant in tenants
+                )
+            except ApiError as exc:
+                errors["installations"] = str(exc)
+
+        try:
+            counts["modules"] = len(self.api_client.list_modules())
+        except ApiError as exc:
+            errors["modules"] = str(exc)
+
+        try:
+            activities = self.api_client.list_recent_audit_logs()
+        except ApiError as exc:
+            activities = []
+            errors["activity"] = str(exc)
+
+        self.loaded.emit(
+            {"counts": counts, "errors": errors, "activities": activities}
+        )
+
+
+class DashboardPage(QWidget):
+    def __init__(self, api_client=None):
+        super().__init__()
+        self.api_client = api_client
+        self.load_worker = None
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 25, 30, 25)
         layout.setSpacing(18)
@@ -422,14 +479,18 @@ class DashboardPage(QWidget):
         heading = QHBoxLayout()
         heading.addWidget(make_title("Dashboard"))
         heading.addStretch()
+        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.clicked.connect(self.load_dashboard)
+        heading.addWidget(self.refresh_button)
         developer_tag = QLabel("DEVELOPER")
         developer_tag.setObjectName("roleTag")
         heading.addWidget(developer_tag)
         layout.addLayout(heading)
 
         intro = QLabel(
-            "Pusat pemantauan SIMPATI Universal. Data ringkasan akan tersedia "
-            "setelah endpoint Dashboard dihubungkan."
+            "Ringkasan diperoleh langsung dari Universal API. Data yang belum "
+            "didukung API akan ditandai secara eksplisit."
         )
         intro.setObjectName("subtleText")
         intro.setWordWrap(True)
@@ -437,14 +498,27 @@ class DashboardPage(QWidget):
 
         stats = QGridLayout()
         stats.setSpacing(12)
-        for index, (title, detail) in enumerate(
+        self.stat_values = {}
+        for index, (key, title, detail) in enumerate(
             (
-                ("TOTAL TENANT", "Tenant terdaftar"),
-                ("LISENSI AKTIF", "Status active"),
-                ("RESTRICTED", "Lisensi dibatasi"),
-                ("EXPIRED", "Lisensi berakhir"),
-                ("INSTALASI", "Perangkat terdaftar"),
-                ("MODUL SISTEM", "Data modul tersedia"),
+                ("tenants", "TOTAL TENANT", "Tenant terdaftar"),
+                (
+                    "active_licenses",
+                    "LISENSI AKTIF",
+                    "Belum tersedia melalui Universal API",
+                ),
+                (
+                    "restricted_licenses",
+                    "RESTRICTED",
+                    "Belum tersedia melalui Universal API",
+                ),
+                (
+                    "expired_licenses",
+                    "EXPIRED",
+                    "Belum tersedia melalui Universal API",
+                ),
+                ("installations", "INSTALASI", "Perangkat terdaftar"),
+                ("modules", "MODUL SISTEM", "Katalog modul"),
             )
         ):
             card = QFrame()
@@ -453,15 +527,20 @@ class DashboardPage(QWidget):
             card_layout.setContentsMargins(16, 14, 16, 14)
             name = QLabel(title)
             name.setObjectName("statLabel")
-            value = QLabel("—")
+            value = QLabel("N/D" if "licenses" in key else "—")
             value.setObjectName("statValue")
-            value.setToolTip("Belum ada data dari API.")
+            if "licenses" in key:
+                value.setToolTip(
+                    "Universal API saat ini tidak menyediakan endpoint data "
+                    "lisensi."
+                )
             caption = QLabel(detail)
             caption.setObjectName("subtleText")
             card_layout.addWidget(name)
             card_layout.addWidget(value)
             card_layout.addWidget(caption)
             stats.addWidget(card, index // 3, index % 3)
+            self.stat_values[title] = value
         layout.addLayout(stats)
 
         connection_card = QFrame()
@@ -490,15 +569,393 @@ class DashboardPage(QWidget):
         activity_layout = QVBoxLayout(activity_card)
         activity_layout.setContentsMargins(18, 16, 18, 16)
         activity_layout.addWidget(QLabel("AKTIVITAS TERBARU"))
-        activity = QLabel(
-            "Belum ada aktivitas. Log akan ditampilkan setelah endpoint "
-            "audit dihubungkan."
-        )
-        activity.setObjectName("subtleText")
-        activity.setWordWrap(True)
-        activity_layout.addWidget(activity)
+        self.activity_label = QLabel("Aktivitas akan dimuat dari API.")
+        self.activity_label.setObjectName("subtleText")
+        self.activity_label.setWordWrap(True)
+        self.activity_label.setTextFormat(Qt.TextFormat.PlainText)
+        activity_layout.addWidget(self.activity_label)
         layout.addWidget(activity_card)
+        self.data_status = make_status_label(
+            "DATA DASHBOARD: BELUM DIMUAT"
+        )
+        layout.addWidget(self.data_status)
         layout.addStretch()
+
+    def load_dashboard(self):
+        if self.api_client is None:
+            self.data_status.setText(
+                "DATA DASHBOARD: UNIVERSAL API BELUM TERHUBUNG"
+            )
+            self.data_status.setStyleSheet("color:#A32323;")
+            return
+        if self.load_worker and self.load_worker.isRunning():
+            return
+
+        self.refresh_button.setEnabled(False)
+        self.data_status.setText("DATA DASHBOARD: MEMUAT DARI API...")
+        self.data_status.setStyleSheet("")
+        self.load_worker = DashboardLoadWorker(self.api_client)
+        self.load_worker.loaded.connect(self.show_dashboard_data)
+        self.load_worker.start()
+
+    def show_dashboard_data(self, snapshot):
+        counts = snapshot["counts"]
+        errors = snapshot["errors"]
+        metric_keys = {
+            "TOTAL TENANT": "tenants",
+            "INSTALASI": "installations",
+            "MODUL SISTEM": "modules",
+        }
+        for title, metric_key in metric_keys.items():
+            value = counts[metric_key]
+            error = errors.get(metric_key)
+            self.stat_values[title].setText(
+                "Gagal" if error else str(value)
+            )
+            self.stat_values[title].setToolTip(error or "Data dari Universal API.")
+
+        activities = snapshot["activities"]
+        if "activity" in errors:
+            self.activity_label.setText(
+                "Aktivitas gagal dimuat dari Universal API: "
+                + errors["activity"]
+            )
+        elif not activities:
+            self.activity_label.setText("Belum ada aktivitas pada server.")
+        else:
+            self.activity_label.setText(
+                "\n".join(
+                    (
+                        f"{log['created_at']} | {log.get('action', '—')} | "
+                        f"{log.get('entity', '—')} "
+                        f"(aktor {log.get('actor_type', '—')} "
+                        f"{log.get('actor_id', '—')})"
+                    )
+                    for log in activities
+                )
+            )
+
+        if errors:
+            messages = [
+                f"{name}: {message}" for name, message in errors.items()
+            ]
+            self.data_status.setText(
+                "DATA DASHBOARD: SEBAGIAN GAGAL DIMUAT"
+            )
+            self.data_status.setToolTip("\n".join(messages))
+            self.data_status.setStyleSheet("color:#A32323;")
+        else:
+            self.data_status.setText(
+                "DATA DASHBOARD: DIPERBARUI DARI UNIVERSAL API"
+            )
+            self.data_status.setToolTip(
+                "Data lisensi belum tersedia karena endpoint lisensi belum "
+                "disediakan Universal API."
+            )
+            self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
+        self.refresh_button.setEnabled(True)
+
+    def wait_for_load(self):
+        if self.load_worker and self.load_worker.isRunning():
+            self.load_worker.wait()
+
+
+class TenantModuleWorker(QThread):
+    loaded = Signal(object, str)
+    failed = Signal(str)
+
+    def __init__(
+        self, api_client, tenant_id, action=None, module_code=None
+    ):
+        super().__init__()
+        self.api_client = api_client
+        self.tenant_id = tenant_id
+        self.action = action
+        self.module_code = module_code
+
+    def run(self):
+        success_message = ""
+        if self.action == "enable":
+            try:
+                self.api_client.enable_tenant_module(
+                    self.tenant_id, self.module_code
+                )
+            except ApiError as exc:
+                self.failed.emit(str(exc))
+                return
+            success_message = (
+                f"Assignment modul {self.module_code} diaktifkan."
+            )
+        elif self.action == "disable":
+            try:
+                self.api_client.disable_tenant_module(
+                    self.tenant_id, self.module_code
+                )
+            except ApiError as exc:
+                self.failed.emit(str(exc))
+                return
+            success_message = (
+                f"Assignment modul {self.module_code} dinonaktifkan."
+            )
+
+        try:
+            modules = self.api_client.list_tenant_modules(self.tenant_id)
+        except ApiError as exc:
+            if success_message:
+                self.loaded.emit(
+                    None,
+                    success_message
+                    + " Namun daftar modul gagal dimuat ulang: "
+                    + str(exc),
+                )
+            else:
+                self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(modules, success_message)
+
+
+class LicensePage(QWidget):
+    def __init__(self, api_client=None):
+        super().__init__()
+        self.api_client = api_client
+        self.worker = None
+        self.request_pending = False
+        self.loaded_tenant_id = None
+        self.pending_tenant_id = None
+        self.modules_by_code = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(14)
+        layout.addWidget(make_title("Manajemen Lisensi"))
+
+        self.license_note = QLabel(
+            "Universal API saat ini belum menyediakan model atau endpoint "
+            "lisensi. Daftar dan pembuatan lisensi, masa berlaku, paket, "
+            "batas penggunaan, serta status lisensi belum dapat dikelola "
+            "melalui Desktop."
+        )
+        self.license_note.setObjectName("subtleText")
+        self.license_note.setWordWrap(True)
+        layout.addWidget(self.license_note)
+
+        module_title = QLabel("OTORISASI MODUL TENANT")
+        module_title.setObjectName("statLabel")
+        layout.addWidget(module_title)
+        module_note = QLabel(
+            "Bagian ini mengelola assignment modul yang tersedia di API; "
+            "assignment bukan lisensi dan tidak memberikan hak validasi "
+            "lisensi."
+        )
+        module_note.setObjectName("subtleText")
+        module_note.setWordWrap(True)
+        layout.addWidget(module_note)
+
+        toolbar = QHBoxLayout()
+        self.tenant_id_input = QLineEdit()
+        self.tenant_id_input.setPlaceholderText("ID Tenant")
+        self.tenant_id_input.setMaximumWidth(180)
+        self.tenant_id_input.textChanged.connect(
+            self.update_action_buttons
+        )
+        toolbar.addWidget(QLabel("Tenant ID"))
+        toolbar.addWidget(self.tenant_id_input)
+        self.load_button = QPushButton("Muat Modul")
+        self.load_button.clicked.connect(self.load_modules)
+        toolbar.addWidget(self.load_button)
+        self.enable_button = QPushButton("Aktifkan Assignment")
+        self.enable_button.setEnabled(False)
+        self.enable_button.clicked.connect(
+            lambda: self.change_selected_module("enable")
+        )
+        toolbar.addWidget(self.enable_button)
+        self.disable_button = QPushButton("Nonaktifkan Assignment")
+        self.disable_button.setObjectName("secondaryButton")
+        self.disable_button.setEnabled(False)
+        self.disable_button.clicked.connect(
+            lambda: self.change_selected_module("disable")
+        )
+        toolbar.addWidget(self.disable_button)
+        toolbar.addStretch()
+        layout.addLayout(toolbar)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(
+            ["KODE MODUL", "NAMA MODUL", "STATUS ASSIGNMENT"]
+        )
+        self.table.setMinimumHeight(230)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.table.itemSelectionChanged.connect(
+            self.update_action_buttons
+        )
+        layout.addWidget(self.table, 1)
+
+        self.empty_label = QLabel(
+            "Masukkan ID Tenant lalu muat daftar assignment modul dari API."
+        )
+        self.empty_label.setObjectName("emptyState")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        self.empty_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.empty_label)
+        self.data_status = make_status_label(
+            "STATUS MODUL: BELUM DIMUAT"
+        )
+        self.data_status.setWordWrap(True)
+        layout.addWidget(self.data_status)
+
+    def load_modules(self):
+        tenant_id = self._tenant_id()
+        if tenant_id is None:
+            self._show_error("Masukkan ID Tenant berupa bilangan positif.")
+            return
+        if self.api_client is None:
+            self._show_error("Client Universal API tidak tersedia.")
+            return
+        self._start_request(tenant_id)
+
+    def change_selected_module(self, action):
+        row = self.table.currentRow()
+        if row < 0:
+            self._show_error("Pilih satu modul terlebih dahulu.")
+            return
+        item = self.table.item(row, 0)
+        module_code = (
+            item.data(Qt.ItemDataRole.UserRole) if item else None
+        )
+        tenant_id = self._tenant_id()
+        if (
+            tenant_id is None
+            or tenant_id != self.loaded_tenant_id
+            or not isinstance(module_code, str)
+        ):
+            self._show_error(
+                "Muat daftar modul untuk Tenant yang dipilih terlebih dahulu."
+            )
+            return
+        if self.api_client is None:
+            self._show_error("Client Universal API tidak tersedia.")
+            return
+        self._start_request(tenant_id, action, module_code)
+
+    def _tenant_id(self):
+        value = self.tenant_id_input.text().strip()
+        if not value.isdecimal():
+            return None
+        tenant_id = int(value)
+        return tenant_id if tenant_id > 0 else None
+
+    def _start_request(self, tenant_id, action=None, module_code=None):
+        if self.request_pending:
+            return
+        self.request_pending = True
+        self.loaded_tenant_id = None
+        self.pending_tenant_id = tenant_id
+        self.modules_by_code = {}
+        self.table.setRowCount(0)
+        self.empty_label.setText("Memuat assignment modul dari API...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText("STATUS MODUL: MEMUAT...")
+        self.data_status.setStyleSheet("")
+        self.load_button.setEnabled(False)
+        self.update_action_buttons()
+        self.worker = TenantModuleWorker(
+            self.api_client, tenant_id, action, module_code
+        )
+        self.worker.loaded.connect(self._show_modules)
+        self.worker.failed.connect(self._show_error)
+        self.worker.finished.connect(self._request_finished)
+        self.worker.start()
+
+    def _show_modules(self, modules, message):
+        if modules is None:
+            self._show_error(message)
+            return
+        self.table.setRowCount(len(modules))
+        self.modules_by_code = {
+            module["code"]: module for module in modules
+        }
+        for row, module in enumerate(modules):
+            code_item = QTableWidgetItem(module["code"])
+            code_item.setData(
+                Qt.ItemDataRole.UserRole, module["code"]
+            )
+            self.table.setItem(row, 0, code_item)
+            self.table.setItem(
+                row, 1, QTableWidgetItem(module["name"])
+            )
+            self.table.setItem(
+                row, 2, QTableWidgetItem(module["status"])
+            )
+
+        self.loaded_tenant_id = self.pending_tenant_id
+        self.empty_label.setText(
+            "Tidak ada data modul dari Universal API."
+        )
+        self.empty_label.setVisible(not modules)
+        self.data_status.setText(
+            message or f"DATA MODUL: {len(modules)} DIMUAT DARI API"
+        )
+        self.data_status.setToolTip(
+            "Assignment modul bukan lisensi dan tidak menggantikan "
+            "License Manager."
+        )
+        self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
+        self.update_action_buttons()
+
+    def _show_error(self, message):
+        self.data_status.setText("DATA MODUL: GAGAL")
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+        self.empty_label.setText(message)
+        self.empty_label.setVisible(True)
+        self.update_action_buttons()
+
+    def update_action_buttons(self, *_):
+        row = self.table.currentRow()
+        selected = self.table.item(row, 0) if row >= 0 else None
+        module_code = (
+            selected.data(Qt.ItemDataRole.UserRole)
+            if selected
+            else None
+        )
+        module = self.modules_by_code.get(module_code)
+        can_change = (
+            not self.request_pending
+            and self._tenant_id() == self.loaded_tenant_id
+            and module is not None
+        )
+        self.load_button.setEnabled(not self.request_pending)
+        self.enable_button.setEnabled(
+            can_change
+            and module["is_active"]
+            and module["status"] in ("DISABLED", "UNASSIGNED")
+        )
+        self.disable_button.setEnabled(
+            can_change
+            and module["status"] == "ENABLED"
+            and module["code"] != "CORE"
+        )
+
+    def _request_finished(self):
+        self.request_pending = False
+        self.update_action_buttons()
+
+    def wait_for_load(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.wait()
 
 
 class DataPage(QWidget):
@@ -1053,6 +1510,834 @@ class TenantPage(DataPage):
             self.tenant_worker.wait()
 
 
+class InstallationsListWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, include_deleted=False):
+        super().__init__()
+        self.api_client = api_client
+        self.include_deleted = include_deleted
+
+    def run(self):
+        try:
+            installations = self.api_client.list_installations(
+                self.include_deleted
+            )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(installations)
+
+
+class InstallationDetailWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, tenant_id, installation_id):
+        super().__init__()
+        self.api_client = api_client
+        self.tenant_id = tenant_id
+        self.installation_id = installation_id
+
+    def run(self):
+        try:
+            installation = self.api_client.get_tenant_installation(
+                self.tenant_id, self.installation_id
+            )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(installation)
+
+
+class InstallationPage(DataPage):
+    def __init__(self, api_client):
+        self.api_client = api_client
+        self.installations_worker = None
+        self.detail_worker = None
+        self.list_request_pending = False
+        self.tenants_by_id = {}
+        self.load_error = None
+        super().__init__(
+            "Manajemen Instalasi",
+            "Daftar instalasi aktif Tenant dan informasi perangkat dari "
+            "Universal API. Klik dua kali untuk memuat detail dari server.",
+            [
+                "NO.",
+                "INSTALLATION ID",
+                "TENANT",
+                "DEVICE ID",
+                "NAMA PERANGKAT",
+                "PLATFORM",
+                "VERSI APLIKASI",
+                "STATUS",
+                "TERAKHIR AKTIF",
+            ],
+            filter_column=7,
+            filter_values=("ACTIVE", "REVOKED"),
+        )
+        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.clicked.connect(self.load_installations)
+        self.toolbar.addWidget(self.refresh_button)
+        self.include_revoked = QCheckBox(
+            "Sertakan instalasi dicabut"
+        )
+        self.include_revoked.stateChanged.connect(
+            lambda *_: self.load_installations()
+        )
+        self.toolbar.addWidget(self.include_revoked)
+        self.empty_label.setText(
+            "Buka menu ini untuk memuat instalasi dari Universal API."
+        )
+
+    def load_installations(self):
+        if self.api_client is None:
+            self._show_load_error("Client Universal API tidak tersedia.")
+            return
+        if self.list_request_pending:
+            return
+        if self.detail_worker and self.detail_worker.isRunning():
+            return
+        self.list_request_pending = True
+        self.load_error = None
+        self.table.setRowCount(0)
+        self.empty_label.setText("Memuat daftar instalasi dari API...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText("DATA INSTALASI: MEMUAT...")
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self.refresh_button.setEnabled(False)
+        self.include_revoked.setEnabled(False)
+        self.installations_worker = InstallationsListWorker(
+            self.api_client, self.include_revoked.isChecked()
+        )
+        self.installations_worker.loaded.connect(self._show_installations)
+        self.installations_worker.failed.connect(self._show_load_error)
+        self.installations_worker.finished.connect(
+            self._installations_finished
+        )
+        self.installations_worker.start()
+
+    def _show_installations(self, installations):
+        self.tenants_by_id = {}
+        self.installations_by_identity = {}
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(installations))
+            for row, installation in enumerate(installations):
+                tenant_id = installation["tenant_id"]
+                identity = (tenant_id, installation["id"])
+                self.installations_by_identity[identity] = installation
+                tenant = {
+                    "id": tenant_id,
+                    "code": installation["tenant_code"],
+                    "name": installation["tenant_name"],
+                }
+                self.tenants_by_id[tenant_id] = tenant
+                device = installation["device"]
+                tenant_label = (
+                    f"{tenant['code']} — {tenant['name']}"
+                )
+                values = (
+                    row + 1,
+                    installation["id"],
+                    tenant_label,
+                    device["id"],
+                    device.get("name") or "—",
+                    device["platform"],
+                    device.get("app_version") or "—",
+                    installation["status"],
+                    installation.get("last_seen_at") or "—",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column == 1:
+                        item.setData(
+                            Qt.ItemDataRole.UserRole,
+                            {
+                                "tenant_id": tenant_id,
+                                "installation_id": installation["id"],
+                            },
+                        )
+                    elif column == 2:
+                        item.setData(
+                            Qt.ItemDataRole.UserRole, tenant_id
+                        )
+                    self.table.setItem(row, column, item)
+        finally:
+            self.table.blockSignals(False)
+
+        self.load_error = None
+        self.data_status.setText(
+            f"DATA INSTALASI: {len(installations)} DIMUAT DARI API"
+        )
+        self.data_status.setToolTip(
+            "Data digabung dari daftar Tenant dan endpoint instalasi per Tenant."
+        )
+        self.data_status.setStyleSheet("")
+        self.refresh_filter_choices()
+        self.filter_table()
+
+    def _show_load_error(self, message):
+        self.load_error = message
+        self.data_status.setText(
+            f"DATA INSTALASI: GAGAL DIMUAT — {message}"
+        )
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+        if self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Tidak dapat memuat instalasi dari Universal API.\n" + message
+            )
+            self.empty_label.setVisible(True)
+
+    def _installations_finished(self):
+        self.list_request_pending = False
+        self.refresh_button.setEnabled(True)
+        self.include_revoked.setEnabled(True)
+
+    def update_empty_state(self, visible_count=None):
+        if self.load_error and self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Tidak dapat memuat instalasi dari Universal API.\n"
+                + self.load_error
+            )
+            self.empty_label.setVisible(True)
+            return
+        if self.table.rowCount() == 0:
+            include_revoked = getattr(self, "include_revoked", None)
+            message = (
+                "Belum ada instalasi pada server."
+                if include_revoked and include_revoked.isChecked()
+                else "Belum ada instalasi aktif pada server."
+            )
+            self.empty_label.setText(message)
+            self.empty_label.setVisible(True)
+            return
+        super().update_empty_state(visible_count)
+
+    def show_details(self, row, column):
+        self.table.setCurrentCell(row, column)
+        item = self.table.item(row, 1)
+        identity = (
+            item.data(Qt.ItemDataRole.UserRole) if item else None
+        )
+        if (
+            not isinstance(identity, dict)
+            or type(identity.get("tenant_id")) is not int
+            or type(identity.get("installation_id")) is not int
+        ):
+            self._show_detail_error(
+                "Identitas instalasi pada daftar tidak valid."
+            )
+            return
+        installation = self.installations_by_identity.get(
+            (identity["tenant_id"], identity["installation_id"])
+        )
+        if installation and installation.get("deleted_at") is not None:
+            self._show_installation_detail(installation)
+            return
+        if self.api_client is None:
+            self._show_detail_error("Client Universal API tidak tersedia.")
+            return
+        if self.detail_worker and self.detail_worker.isRunning():
+            return
+        self.data_status.setText("DETAIL INSTALASI: MEMUAT DARI API...")
+        self.refresh_button.setEnabled(False)
+        self.include_revoked.setEnabled(False)
+        self.detail_worker = InstallationDetailWorker(
+            self.api_client,
+            identity["tenant_id"],
+            identity["installation_id"],
+        )
+        self.detail_worker.loaded.connect(self._show_installation_detail)
+        self.detail_worker.failed.connect(self._show_detail_error)
+        self.detail_worker.finished.connect(self._detail_finished)
+        self.detail_worker.start()
+
+    def _show_installation_detail(self, installation):
+        tenant = self.tenants_by_id.get(installation["tenant_id"])
+        tenant_name = tenant["name"] if tenant else "—"
+        tenant_code = tenant["code"] if tenant else "—"
+        device = installation["device"]
+        details = device.get("details") or {}
+        lines = [
+            f"Tenant ID: {installation['tenant_id']}",
+            f"Tenant: {tenant_code} — {tenant_name}",
+            f"Installation ID: {installation['id']}",
+            f"Status: {installation['status']}",
+            f"Device ID: {device['id']}",
+            f"Nama perangkat: {device.get('name') or '—'}",
+            f"Platform: {device['platform']}",
+            f"Versi aplikasi: {device.get('app_version') or '—'}",
+            "Informasi perangkat:",
+        ]
+        lines.extend(
+            f"  {name}: {value}"
+            for name, value in sorted(details.items())
+        )
+        lines.extend(
+            (
+                f"Pertama terlihat: {installation['first_seen_at']}",
+                "Terakhir aktif: "
+                + (installation.get("last_seen_at") or "—"),
+                f"Dibuat: {installation['created_at']}",
+                f"Diperbarui: {installation['updated_at']}",
+                "Dihapus: " + (installation.get("deleted_at") or "—"),
+            )
+        )
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Detail Instalasi")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("\n".join(lines))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
+        self.data_status.setText(
+            "DETAIL INSTALASI: DIMUAT DARI UNIVERSAL API"
+        )
+        self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
+
+    def _show_detail_error(self, message):
+        self.data_status.setText(
+            f"DETAIL INSTALASI: GAGAL DIMUAT — {message}"
+        )
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+
+    def _detail_finished(self):
+        self.refresh_button.setEnabled(True)
+        self.include_revoked.setEnabled(True)
+
+    def wait_for_load(self):
+        for worker in (
+            self.installations_worker,
+            self.detail_worker,
+        ):
+            if worker and worker.isRunning():
+                worker.wait()
+
+
+class ModuleCatalogWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client):
+        super().__init__()
+        self.api_client = api_client
+
+    def run(self):
+        try:
+            modules = self.api_client.list_modules()
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(modules)
+
+
+class ModuleDetailWorker(QThread):
+    loaded = Signal(object, object, str)
+    failed = Signal(str)
+
+    def __init__(self, api_client, module_id):
+        super().__init__()
+        self.api_client = api_client
+        self.module_id = module_id
+
+    def run(self):
+        try:
+            module = self.api_client.get_module(self.module_id)
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+            return
+        try:
+            usage = self.api_client.list_module_tenant_usage(
+                module["code"]
+            )
+        except ApiError as exc:
+            self.loaded.emit(module, None, str(exc))
+        else:
+            self.loaded.emit(module, usage, "")
+
+
+class ModuleMutationWorker(QThread):
+    saved = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, operation, **values):
+        super().__init__()
+        self.api_client = api_client
+        self.operation = operation
+        self.values = values
+
+    def run(self):
+        try:
+            if self.operation == "create":
+                module = self.api_client.create_module(
+                    self.values["code"],
+                    self.values["name"],
+                    self.values["description"],
+                )
+            elif self.operation == "update":
+                module = self.api_client.update_module(
+                    self.values["module_id"],
+                    self.values["name"],
+                    self.values["description"],
+                )
+            else:
+                module = self.api_client.set_module_active(
+                    self.values["module_id"],
+                    self.values["is_active"],
+                )
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.saved.emit(module)
+
+
+class ModulePage(DataPage):
+    def __init__(self, api_client):
+        self.api_client = api_client
+        self.catalog_loaded = False
+        self.load_error = None
+        self.catalog_pending = False
+        self.mutation_pending = False
+        self.pending_dialog = None
+        self.modules_by_id = {}
+        self.catalog_worker = None
+        self.detail_worker = None
+        self.mutation_worker = None
+        super().__init__(
+            "Modul Sistem",
+            "Katalog, status katalog, dan data penggunaan per Tenant dari "
+            "Universal API.",
+            [
+                "NO.",
+                "MODULE ID",
+                "KODE MODUL",
+                "NAMA MODUL",
+                "DESKRIPSI",
+                "STATUS KATALOG",
+            ],
+            filter_column=5,
+            filter_values=("ACTIVE", "INACTIVE"),
+        )
+        self.distinction_note = QLabel(
+            "Status katalog tidak sama dengan assignment Tenant; keduanya "
+            "juga bukan lisensi. Penggunaan per Tenant ditampilkan pada detail."
+        )
+        self.distinction_note.setObjectName("subtleText")
+        self.distinction_note.setWordWrap(True)
+        self.layout().insertWidget(2, self.distinction_note)
+        self.refresh_button = QPushButton("Muat Ulang")
+        self.refresh_button.setObjectName("secondaryButton")
+        self.refresh_button.clicked.connect(self.load_modules)
+        self.toolbar.addWidget(self.refresh_button)
+        self.create_button = QPushButton("+ Tambah Modul")
+        self.create_button.clicked.connect(self.open_create_form)
+        self.toolbar.addWidget(self.create_button)
+        self.edit_module_button = QPushButton("Edit Detail")
+        self.edit_module_button.setObjectName("secondaryButton")
+        self.edit_module_button.setEnabled(False)
+        self.edit_module_button.clicked.connect(self.open_edit_form)
+        self.toolbar.addWidget(self.edit_module_button)
+        self.status_button = QPushButton("Ubah Status")
+        self.status_button.setObjectName("secondaryButton")
+        self.status_button.setEnabled(False)
+        self.status_button.clicked.connect(self.toggle_module_status)
+        self.toolbar.addWidget(self.status_button)
+        self.table.itemSelectionChanged.connect(self.update_module_buttons)
+        self.distinction_note.setTextFormat(Qt.TextFormat.PlainText)
+        self.empty_label.setText(
+            "Buka menu ini untuk memuat katalog modul dari Universal API."
+        )
+
+    def load_modules(self):
+        if self.api_client is None:
+            self._show_catalog_error("Client Universal API tidak tersedia.")
+            return
+        if self.catalog_pending or self.mutation_pending:
+            return
+        self.catalog_pending = True
+        self.table.setRowCount(0)
+        self.modules_by_id = {}
+        self.load_error = None
+        self.empty_label.setText("Memuat katalog modul dari API...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText("KATALOG MODUL: MEMUAT...")
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self.update_module_buttons()
+        self.catalog_worker = ModuleCatalogWorker(self.api_client)
+        self.catalog_worker.loaded.connect(self._show_modules)
+        self.catalog_worker.failed.connect(self._show_catalog_error)
+        self.catalog_worker.finished.connect(self._catalog_finished)
+        self.catalog_worker.start()
+
+    def _catalog_finished(self):
+        self.catalog_pending = False
+        self.refresh_button.setEnabled(True)
+        self.update_module_buttons()
+
+    def _show_modules(self, modules):
+        self.modules_by_id = {
+            module["id"]: module for module in modules
+        }
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(modules))
+            for row, module in enumerate(modules):
+                values = (
+                    row + 1,
+                    module["id"],
+                    module["code"],
+                    module["name"],
+                    module.get("description") or "—",
+                    "ACTIVE" if module["is_active"] else "INACTIVE",
+                )
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    if column == 1:
+                        item.setData(
+                            Qt.ItemDataRole.UserRole, module["id"]
+                        )
+                    self.table.setItem(row, column, item)
+        finally:
+            self.table.blockSignals(False)
+        self.catalog_loaded = True
+        self.load_error = None
+        self.data_status.setText(
+            f"KATALOG MODUL: {len(modules)} DIMUAT DARI API"
+        )
+        self.data_status.setToolTip(
+            "Status ACTIVE/INACTIVE adalah status katalog dari Universal API."
+        )
+        self.data_status.setStyleSheet("")
+        self.refresh_filter_choices()
+        self.filter_table()
+        self.update_module_buttons()
+
+    def _show_catalog_error(self, message):
+        self.load_error = message
+        self.data_status.setText(f"KATALOG MODUL: GAGAL DIMUAT — {message}")
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+        if self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Tidak dapat memuat katalog dari Universal API.\n" + message
+            )
+            self.empty_label.setVisible(True)
+
+    def update_empty_state(self, visible_count=None):
+        if self.load_error and self.table.rowCount() == 0:
+            self.empty_label.setText(
+                "Tidak dapat memuat katalog dari Universal API.\n"
+                + self.load_error
+            )
+            self.empty_label.setVisible(True)
+            return
+        if self.table.rowCount() == 0 and self.catalog_loaded:
+            self.empty_label.setText("Belum ada data katalog modul.")
+            self.empty_label.setVisible(True)
+            return
+        if self.table.rowCount() == 0 and not self.catalog_loaded:
+            if not self.load_error:
+                self.empty_label.setText(
+                    "Buka menu ini untuk memuat katalog modul dari "
+                    "Universal API."
+                )
+                self.empty_label.setVisible(True)
+            return
+        super().update_empty_state(visible_count)
+
+    def _selected_module(self):
+        row = self.table.currentRow()
+        item = self.table.item(row, 1) if row >= 0 else None
+        module_id = (
+            item.data(Qt.ItemDataRole.UserRole) if item else None
+        )
+        return self.modules_by_id.get(module_id)
+
+    def update_module_buttons(self):
+        module = self._selected_module()
+        busy = self.catalog_pending or self.mutation_pending
+        self.refresh_button.setEnabled(not busy)
+        self.create_button.setEnabled(not busy)
+        self.edit_module_button.setEnabled(not busy and module is not None)
+        if module is None:
+            self.status_button.setText("Ubah Status")
+        else:
+            self.status_button.setText(
+                "Nonaktifkan Modul"
+                if module["is_active"]
+                else "Aktifkan Modul"
+            )
+        can_change_status = (
+            not busy
+            and module is not None
+            and not (module["code"] == "CORE" and module["is_active"])
+        )
+        self.status_button.setEnabled(can_change_status)
+
+    def open_create_form(self):
+        if self.api_client is None:
+            self._show_catalog_error("Client Universal API tidak tersedia.")
+            return
+        dialog = FormDialog(
+            "Tambah Modul",
+            [("KODE MODUL", True), ("NAMA MODUL", True), ("DESKRIPSI", False)],
+            parent=self,
+            submit_handler=self._submit_create,
+        )
+        dialog.inputs["KODE MODUL"].setMaxLength(50)
+        dialog.inputs["NAMA MODUL"].setMaxLength(150)
+        dialog.inputs["DESKRIPSI"].setMaxLength(4000)
+        dialog.exec()
+
+    def _submit_create(self, dialog):
+        values = dialog.values()
+        self._start_mutation(
+            dialog,
+            "create",
+            code=values["KODE MODUL"],
+            name=values["NAMA MODUL"],
+            description=values["DESKRIPSI"] or None,
+        )
+
+    def open_edit_form(self):
+        module = self._selected_module()
+        if module is None:
+            return
+        dialog = FormDialog(
+            "Edit Modul",
+            [("NAMA MODUL", True), ("DESKRIPSI", False)],
+            {
+                "NAMA MODUL": module["name"],
+                "DESKRIPSI": module.get("description") or "",
+            },
+            parent=self,
+            submit_handler=lambda form: self._submit_edit(
+                form, module["id"]
+            ),
+        )
+        dialog.inputs["NAMA MODUL"].setMaxLength(150)
+        dialog.inputs["DESKRIPSI"].setMaxLength(4000)
+        dialog.exec()
+
+    def _submit_edit(self, dialog, module_id):
+        values = dialog.values()
+        self._start_mutation(
+            dialog,
+            "update",
+            module_id=module_id,
+            name=values["NAMA MODUL"],
+            description=values["DESKRIPSI"] or None,
+        )
+
+    def toggle_module_status(self):
+        module = self._selected_module()
+        if module is None:
+            return
+        self._start_mutation(
+            None,
+            "status",
+            module_id=module["id"],
+            is_active=not module["is_active"],
+        )
+
+    def _start_mutation(self, dialog, operation, **values):
+        if self.api_client is None:
+            if dialog:
+                dialog.show_error("Client Universal API tidak tersedia.")
+            else:
+                self._show_catalog_error(
+                    "Client Universal API tidak tersedia."
+                )
+            return
+        if self.catalog_pending or self.mutation_pending:
+            return
+        self.mutation_pending = True
+        self.pending_dialog = dialog
+        if dialog:
+            dialog.set_busy(True)
+            dialog.validation_message.setText(
+                "Menyimpan ke Universal API..."
+            )
+        self.data_status.setText("PERUBAHAN MODUL: MENYIMPAN...")
+        self.data_status.setStyleSheet("")
+        self.update_module_buttons()
+        self.mutation_worker = ModuleMutationWorker(
+            self.api_client, operation, **values
+        )
+        self.mutation_worker.saved.connect(self._module_saved)
+        self.mutation_worker.failed.connect(self._module_mutation_failed)
+        self.mutation_worker.finished.connect(self._mutation_finished)
+        self.mutation_worker.start()
+
+    def _module_saved(self, module):
+        dialog = self.pending_dialog
+        self._upsert_module(module)
+        if dialog:
+            dialog.accept()
+        self.data_status.setText(
+            f"MODUL {module['code']}: PERUBAHAN TERSIMPAN DI API"
+        )
+        self.data_status.setToolTip(
+            "Data modul diperbarui melalui Universal API."
+        )
+        self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
+
+    def _module_mutation_failed(self, message):
+        if self.pending_dialog:
+            self.pending_dialog.set_busy(False)
+            self.pending_dialog.show_error(message)
+        self.data_status.setText("PERUBAHAN MODUL: GAGAL")
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+
+    def _mutation_finished(self):
+        self.mutation_pending = False
+        self.pending_dialog = None
+        self.update_module_buttons()
+
+    def _upsert_module(self, module):
+        module_id = module["id"]
+        row = next(
+            (
+                index
+                for index in range(self.table.rowCount())
+                if self.table.item(index, 1).data(
+                    Qt.ItemDataRole.UserRole
+                )
+                == module_id
+            ),
+            None,
+        )
+        if row is None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+        self.modules_by_id[module_id] = module
+        values = (
+            row + 1,
+            module["id"],
+            module["code"],
+            module["name"],
+            module.get("description") or "—",
+            "ACTIVE" if module["is_active"] else "INACTIVE",
+        )
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            if column == 1:
+                item.setData(Qt.ItemDataRole.UserRole, module_id)
+            self.table.setItem(row, column, item)
+        self.refresh_filter_choices()
+        self.filter_table()
+        self.update_module_buttons()
+
+    def show_details(self, row, column):
+        self.table.setCurrentCell(row, column)
+        module = self._selected_module()
+        if module is None:
+            self._show_catalog_error("ID modul pada tabel tidak valid.")
+            return
+        if self.api_client is None:
+            self._show_catalog_error("Client Universal API tidak tersedia.")
+            return
+        if self.detail_worker and self.detail_worker.isRunning():
+            return
+        self.data_status.setText("DETAIL MODUL: MEMUAT DARI API...")
+        self.detail_worker = ModuleDetailWorker(
+            self.api_client, module["id"]
+        )
+        self.detail_worker.loaded.connect(self._show_module_detail)
+        self.detail_worker.failed.connect(self._show_module_detail_error)
+        self.detail_worker.start()
+
+    def _show_module_detail(self, module, usage, usage_error):
+        lines = [
+            f"Module ID: {module['id']}",
+            f"Kode: {module['code']}",
+            f"Nama: {module['name']}",
+            f"Deskripsi: {module.get('description') or '—'}",
+            "Status katalog: "
+            + ("ACTIVE" if module["is_active"] else "INACTIVE"),
+            f"Dibuat: {module['created_at']}",
+            f"Diperbarui: {module['updated_at']}",
+            "",
+            "PENGGUNAAN PER TENANT",
+        ]
+        if usage_error:
+            lines.append(
+                "Data penggunaan gagal dimuat dari Universal API: "
+                + usage_error
+            )
+        elif not usage:
+            lines.append("Tidak ada Tenant pada server.")
+        else:
+            enabled = sum(item["is_enabled"] for item in usage)
+            assigned_but_disabled = sum(
+                item["is_assigned"] and not item["is_enabled"]
+                for item in usage
+            )
+            lines.extend(
+                (
+                    f"Assignment aktif: {enabled}",
+                    f"Assignment nonaktif: {assigned_but_disabled}",
+                    "",
+                )
+            )
+            assigned_tenants = [
+                item for item in usage if item["is_assigned"]
+            ]
+            if not assigned_tenants:
+                lines.append("Belum ada assignment modul pada Tenant.")
+            else:
+                lines.extend(
+                    f"{item['tenant_code']} — {item['tenant_name']}: "
+                    f"{item['status']}"
+                    for item in assigned_tenants
+                )
+        lines.extend(
+            (
+                "",
+                "Status katalog, assignment modul, dan lisensi adalah data "
+                "yang berbeda.",
+            )
+        )
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Detail Modul")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("\n".join(lines))
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.exec()
+        self.data_status.setText("DETAIL MODUL: DIMUAT DARI UNIVERSAL API")
+        self.data_status.setToolTip(
+            usage_error or "Detail katalog dan penggunaan dari Universal API."
+        )
+        self.data_status.setStyleSheet(
+            "color:#A32323;" if usage_error else f"color:{MUTED_GOLD};"
+        )
+
+    def _show_module_detail_error(self, message):
+        self.data_status.setText(
+            f"DETAIL MODUL: GAGAL DIMUAT — {message}"
+        )
+        self.data_status.setToolTip(message)
+        self.data_status.setStyleSheet("color:#A32323;")
+
+    def wait_for_load(self):
+        for worker in (
+            self.catalog_worker,
+            self.detail_worker,
+            self.mutation_worker,
+        ):
+            if worker and worker.isRunning():
+                worker.wait()
+
+
 class ConfigurationPage(QWidget):
     def __init__(self):
         super().__init__()
@@ -1275,77 +2560,11 @@ class MainWindow(QMainWindow):
 
     def build_pages(self):
         pages = {
-            "dashboard": DashboardPage(),
+            "dashboard": DashboardPage(self.api_client),
             "tenants": TenantPage(self.api_client),
-            "licenses": DataPage(
-                "Manajemen Lisensi",
-                "Paket, periode aktivasi, dan status lisensi tenant.",
-                [
-                    "NO.",
-                    "LICENSE ID",
-                    "TENANT",
-                    "PAKET",
-                    "STATUS",
-                    "TANGGAL AKTIVASI",
-                    "TANGGAL BERAKHIR",
-                ],
-                [
-                    ("LICENSE ID", True),
-                    ("TENANT ID", True),
-                    ("PAKET", True),
-                    ("STATUS", True),
-                    ("TANGGAL AKTIVASI", False),
-                    ("TANGGAL BERAKHIR", False),
-                ],
-                filter_column=4,
-                filter_values=("ACTIVE", "RESTRICTED", "EXPIRED"),
-                add_label="Buat Lisensi",
-            ),
-            "installations": DataPage(
-                "Manajemen Instalasi",
-                "Installation ID, perangkat, OS, dan waktu aktif terakhir.",
-                [
-                    "NO.",
-                    "INSTALLATION ID",
-                    "TENANT",
-                    "NAMA PERANGKAT",
-                    "SISTEM OPERASI",
-                    "STATUS",
-                    "TERAKHIR AKTIF",
-                ],
-                [
-                    ("INSTALLATION ID", True),
-                    ("TENANT ID", True),
-                    ("NAMA PERANGKAT", True),
-                    ("SISTEM OPERASI", False),
-                    ("STATUS", True),
-                ],
-                filter_column=5,
-                filter_values=("ACTIVE", "INACTIVE", "REVOKED"),
-                add_label="Tambah Instalasi",
-            ),
-            "modules": DataPage(
-                "Modul Sistem",
-                "Daftar modul tersedia dan modul yang memerlukan lisensi.",
-                [
-                    "NO.",
-                    "KODE MODUL",
-                    "NAMA MODUL",
-                    "DESKRIPSI",
-                    "KATEGORI",
-                    "STATUS",
-                ],
-                [
-                    ("KODE MODUL", True),
-                    ("NAMA MODUL", True),
-                    ("DESKRIPSI", False),
-                    ("KATEGORI LISENSI", False),
-                    ("STATUS", True),
-                ],
-                filter_column=5,
-                filter_values=("AVAILABLE", "LICENSED", "INACTIVE"),
-                add_label="Kelola Modul",
-            ),
+            "licenses": LicensePage(self.api_client),
+            "installations": InstallationPage(self.api_client),
+            "modules": ModulePage(self.api_client),
             "developers": DataPage(
                 "Pengguna Developer",
                 "Akun, peran, status, dan akses developer.",
@@ -1439,6 +2658,17 @@ class MainWindow(QMainWindow):
         tenant_page = self.page_by_key.get("tenants")
         if tenant_page is not None:
             tenant_page.wait_for_load()
+        installation_page = self.page_by_key.get("installations")
+        if installation_page is not None:
+            installation_page.wait_for_load()
+        module_page = self.page_by_key.get("modules")
+        if module_page is not None:
+            module_page.wait_for_load()
+        license_page = self.page_by_key.get("licenses")
+        if license_page is not None:
+            license_page.wait_for_load()
+        if self.dashboard_page is not None:
+            self.dashboard_page.wait_for_load()
         if (
             self.connection_worker
             and self.connection_worker.isRunning()
@@ -1453,6 +2683,12 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentWidget(page)
         if page_key == "tenants" and self.api_client:
             page.load_tenants()
+        if page_key == "installations" and self.api_client:
+            page.load_installations()
+        if page_key == "modules" and self.api_client:
+            page.load_modules()
+        if page_key == "dashboard" and self.api_client:
+            page.load_dashboard()
         for key, button in self.menu_buttons.items():
             button.setProperty("active", key == page_key)
             button.style().unpolish(button)

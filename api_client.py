@@ -1,6 +1,7 @@
 import hashlib
 import ipaddress
 import json
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -92,6 +93,7 @@ class ApiClient:
     TIMEOUT_SECONDS = 8
     API_SERVICE_PATH = "/health/live"
     TENANT_PAGE_SIZE = 100
+    INSTALLATION_PAGE_SIZE = 100
 
     def __init__(self, base_url="", token_store=None):
         self.token_store = token_store or SecureTokenStore()
@@ -264,6 +266,486 @@ class ApiClient:
             tenants.extend(items)
             offset += len(items)
         return tenants
+
+    @staticmethod
+    def _validate_installation(installation, tenant_id):
+        device = (
+            installation.get("device")
+            if isinstance(installation, dict)
+            else None
+        )
+        if (
+            not isinstance(installation, dict)
+            or type(installation.get("id")) is not int
+            or type(installation.get("tenant_id")) is not int
+            or installation.get("tenant_id") != tenant_id
+            or not isinstance(installation.get("installation_key"), str)
+            or not isinstance(device, dict)
+            or not isinstance(device.get("id"), str)
+            or (
+                device.get("name") is not None
+                and not isinstance(device.get("name"), str)
+            )
+            or not isinstance(device.get("platform"), str)
+            or (
+                device.get("app_version") is not None
+                and not isinstance(device.get("app_version"), str)
+            )
+            or not isinstance(device.get("details"), dict)
+            or installation.get("status") not in ("ACTIVE", "REVOKED")
+            or not isinstance(installation.get("first_seen_at"), str)
+            or (
+                installation.get("last_seen_at") is not None
+                and not isinstance(installation.get("last_seen_at"), str)
+            )
+            or not isinstance(installation.get("created_at"), str)
+            or not isinstance(installation.get("updated_at"), str)
+            or (
+                installation.get("deleted_at") is not None
+                and not isinstance(installation.get("deleted_at"), str)
+            )
+        ):
+            raise ApiError(
+                "Respons instalasi dari Universal API tidak valid."
+            )
+        return installation
+
+    def list_tenant_installations(self, tenant_id, include_deleted=False):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant tidak valid.")
+        if type(include_deleted) is not bool:
+            raise ApiError("Pilihan instalasi dicabut tidak valid.")
+        installations = []
+        offset = 0
+        total = None
+        while total is None or offset < total:
+            limit = self.INSTALLATION_PAGE_SIZE
+            query = urlencode({"limit": limit, "offset": offset})
+            endpoint = (
+                f"/tenants/{tenant_id}/installations/recycle-bin"
+                if include_deleted
+                else f"/tenants/{tenant_id}/installations"
+            )
+            page = self.request(
+                "GET",
+                f"{endpoint}?{query}",
+                authenticated=True,
+            )
+            items = page.get("items")
+            page_total = page.get("total")
+            if (
+                not isinstance(items, list)
+                or type(page_total) is not int
+                or page_total < 0
+                or len(items) > limit
+                or offset + len(items) > page_total
+                or any(
+                    not isinstance(installation, dict)
+                    for installation in items
+                )
+            ):
+                raise ApiError(
+                    "Respons daftar instalasi dari Universal API tidak valid."
+                )
+            if (
+                page.get("limit") != limit
+                or page.get("offset") != offset
+                or any(
+                    installation.get("tenant_id") != tenant_id
+                    for installation in items
+                )
+            ):
+                raise ApiError(
+                    "Metadata daftar instalasi dari Universal API tidak valid."
+                )
+            if total is not None and page_total != total:
+                raise ApiError(
+                    "Jumlah instalasi Tenant berubah saat data sedang dimuat. "
+                    "Muat ulang daftar instalasi."
+                )
+            total = page_total
+            if not items:
+                if offset < total:
+                    raise ApiError(
+                        "Universal API mengembalikan halaman instalasi kosong "
+                        "sebelum seluruh data termuat."
+                    )
+                break
+            validated_items = [
+                self._validate_installation(installation, tenant_id)
+                for installation in items
+            ]
+            if include_deleted and any(
+                item["status"] != "REVOKED" or item["deleted_at"] is None
+                for item in validated_items
+            ):
+                raise ApiError(
+                    "Respons recycle bin instalasi dari Universal API "
+                    "tidak valid."
+                )
+            installations.extend(validated_items)
+            offset += len(items)
+        return installations
+
+    def list_installations(self, include_deleted=False):
+        if type(include_deleted) is not bool:
+            raise ApiError("Pilihan instalasi dicabut tidak valid.")
+        installations = []
+        for tenant in self.list_tenants():
+            tenant_installations = self.list_tenant_installations(
+                tenant["id"]
+            )
+            installations.extend(
+                {
+                    **installation,
+                    "tenant_code": tenant["code"],
+                    "tenant_name": tenant["name"],
+                }
+                for installation in tenant_installations
+            )
+            if include_deleted:
+                deleted_installations = self.list_tenant_installations(
+                    tenant["id"], include_deleted=True
+                )
+                installations.extend(
+                    {
+                        **installation,
+                        "tenant_code": tenant["code"],
+                        "tenant_name": tenant["name"],
+                    }
+                    for installation in deleted_installations
+                )
+        return installations
+
+    def get_tenant_installation(self, tenant_id, installation_id):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant tidak valid.")
+        if type(installation_id) is not int or installation_id < 1:
+            raise ApiError("ID instalasi tidak valid.")
+        installation = self.request(
+            "GET",
+            f"/tenants/{tenant_id}/installations/{installation_id}",
+            authenticated=True,
+        )
+        installation = self._validate_installation(
+            installation, tenant_id
+        )
+        if installation["id"] != installation_id:
+            raise ApiError(
+                "Respons detail instalasi dari Universal API tidak valid."
+            )
+        return installation
+
+    def list_modules(self):
+        response = self.request(
+            "GET", "/modules?include_inactive=true", authenticated=True
+        )
+        modules = response.get("items")
+        if not isinstance(modules, list):
+            raise ApiError(
+                "Respons daftar modul dari Universal API tidak valid."
+            )
+        return [self._validate_module(module) for module in modules]
+
+    @staticmethod
+    def _validate_module(module):
+        if (
+            not isinstance(module, dict)
+            or type(module.get("id")) is not int
+            or not isinstance(module.get("code"), str)
+            or not isinstance(module.get("name"), str)
+            or (
+                module.get("description") is not None
+                and not isinstance(module.get("description"), str)
+            )
+            or type(module.get("is_active")) is not bool
+            or not isinstance(module.get("created_at"), str)
+            or not isinstance(module.get("updated_at"), str)
+        ):
+            raise ApiError(
+                "Respons detail modul dari Universal API tidak valid."
+            )
+        return module
+
+    def get_module(self, module_id):
+        if type(module_id) is not int or module_id < 1:
+            raise ApiError("ID modul tidak valid.")
+        module = self._validate_module(
+            self.request(
+                "GET", f"/modules/{module_id}", authenticated=True
+            )
+        )
+        if module["id"] != module_id:
+            raise ApiError(
+                "Respons detail modul dari Universal API tidak valid."
+            )
+        return module
+
+    @staticmethod
+    def _validate_module_code(module_code):
+        if not isinstance(module_code, str):
+            raise ApiError("Kode modul tidak valid.")
+        module_code = module_code.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,49}", module_code):
+            raise ApiError("Kode modul harus terdiri dari 2–50 huruf, "
+                           "angka, atau garis bawah dan diawali huruf.")
+        return module_code
+
+    def create_module(self, module_code, name, description=None):
+        module_code = self._validate_module_code(module_code)
+        if module_code == "CORE":
+            raise ApiError("CORE dikelola oleh sistem dan tidak dapat dibuat.")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("Nama modul wajib diisi.")
+        if len(name.strip()) > 150:
+            raise ApiError("Nama modul maksimal 150 karakter.")
+        if description is not None and not isinstance(description, str):
+            raise ApiError("Deskripsi modul tidak valid.")
+        description = description.strip() if description else None
+        if description and len(description) > 4000:
+            raise ApiError("Deskripsi modul maksimal 4000 karakter.")
+        response = self.request(
+            "POST",
+            "/modules",
+            {
+                "code": module_code,
+                "name": name.strip(),
+                "description": description or None,
+                "is_active": True,
+            },
+            authenticated=True,
+        )
+        module = self._validate_module(response)
+        if module["code"] != module_code:
+            raise ApiError(
+                "Respons pembuatan modul dari Universal API tidak valid."
+            )
+        return module
+
+    def set_module_active(self, module_id, is_active):
+        if type(module_id) is not int or module_id < 1:
+            raise ApiError("ID modul tidak valid.")
+        if type(is_active) is not bool:
+            raise ApiError("Status modul tidak valid.")
+        module = self._validate_module(
+            self.request(
+                "PATCH",
+                f"/modules/{module_id}",
+                {"is_active": is_active},
+                authenticated=True,
+            )
+        )
+        if module["id"] != module_id or module["is_active"] != is_active:
+            raise ApiError(
+                "Respons perubahan status modul dari Universal API tidak "
+                "valid."
+            )
+        return module
+
+    def update_module(self, module_id, name, description=None):
+        if type(module_id) is not int or module_id < 1:
+            raise ApiError("ID modul tidak valid.")
+        if not isinstance(name, str) or not name.strip():
+            raise ApiError("Nama modul wajib diisi.")
+        if len(name.strip()) > 150:
+            raise ApiError("Nama modul maksimal 150 karakter.")
+        if description is not None and not isinstance(description, str):
+            raise ApiError("Deskripsi modul tidak valid.")
+        description = description.strip() if description else None
+        if description and len(description) > 4000:
+            raise ApiError("Deskripsi modul maksimal 4000 karakter.")
+        module = self._validate_module(
+            self.request(
+                "PATCH",
+                f"/modules/{module_id}",
+                {
+                    "name": name.strip(),
+                    "description": description or None,
+                },
+                authenticated=True,
+            )
+        )
+        if (
+            module["id"] != module_id
+            or module["name"] != name.strip()
+            or module["description"] != (description or None)
+        ):
+            raise ApiError(
+                "Respons perubahan modul dari Universal API tidak valid."
+            )
+        return module
+
+    def count_tenant_installations(self, tenant_id):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant tidak valid.")
+        query = urlencode({"limit": 1, "offset": 0})
+        response = self.request(
+            "GET",
+            f"/tenants/{tenant_id}/installations?{query}",
+            authenticated=True,
+        )
+        items = response.get("items")
+        total = response.get("total")
+        if (
+            not isinstance(items, list)
+            or any(not isinstance(item, dict) for item in items)
+            or type(total) is not int
+            or total < 0
+            or len(items) > 1
+            or len(items) > total
+            or (total > 0 and len(items) != 1)
+            or response.get("limit") != 1
+            or response.get("offset") != 0
+        ):
+            raise ApiError(
+                "Respons jumlah instalasi Tenant dari Universal API tidak "
+                "valid."
+            )
+        return total
+
+    def list_recent_audit_logs(self, limit=5):
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ApiError("Jumlah audit log yang diminta tidak valid.")
+        query = urlencode({"limit": limit, "offset": 0})
+        response = self.request(
+            "GET", f"/auth/audit-logs?{query}", authenticated=True
+        )
+        logs = response.get("items")
+        if (
+            not isinstance(logs, list)
+            or len(logs) > limit
+            or any(
+                not isinstance(log, dict)
+                or not isinstance(log.get("action"), str)
+                or not isinstance(log.get("entity"), str)
+                or not isinstance(log.get("created_at"), str)
+                for log in logs
+            )
+            or response.get("limit") != limit
+            or response.get("offset") != 0
+        ):
+            raise ApiError(
+                "Respons audit log dari Universal API tidak valid."
+            )
+        return logs
+
+    @staticmethod
+    def _validate_module_request(tenant_id, module_code):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant tidak valid.")
+        if not isinstance(module_code, str):
+            raise ApiError("Kode modul tidak valid.")
+        module_code = module_code.strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,49}", module_code):
+            raise ApiError("Kode modul tidak valid.")
+        return module_code
+
+    def list_tenant_modules(self, tenant_id):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant tidak valid.")
+        response = self.request(
+            "GET",
+            f"/tenants/{tenant_id}/modules",
+            authenticated=True,
+        )
+        modules = response.get("items")
+        allowed_statuses = {
+            "ENABLED",
+            "DISABLED",
+            "UNASSIGNED",
+            "CATALOG_INACTIVE",
+        }
+        if (
+            response.get("tenant_id") != tenant_id
+            or not isinstance(modules, list)
+            or any(
+                not isinstance(module, dict)
+                or type(module.get("id")) is not int
+                or not isinstance(module.get("code"), str)
+                or not isinstance(module.get("name"), str)
+                or type(module.get("is_active")) is not bool
+                or type(module.get("is_assigned")) is not bool
+                or type(module.get("is_enabled")) is not bool
+                or module.get("status") not in allowed_statuses
+                for module in modules
+            )
+        ):
+            raise ApiError(
+                "Respons otorisasi modul Tenant dari Universal API tidak "
+                "valid."
+            )
+        return modules
+
+    def list_module_tenant_usage(self, module_code):
+        module_code = self._validate_module_code(module_code)
+        usage = []
+        for tenant in self.list_tenants():
+            tenant_modules = self.list_tenant_modules(tenant["id"])
+            matches = [
+                module
+                for module in tenant_modules
+                if module["code"] == module_code
+            ]
+            if len(matches) != 1:
+                raise ApiError(
+                    "Data katalog modul untuk Tenant tidak konsisten dengan "
+                    "Universal API."
+                )
+            module = matches[0]
+            usage.append(
+                {
+                    "tenant_id": tenant["id"],
+                    "tenant_code": tenant["code"],
+                    "tenant_name": tenant["name"],
+                    "is_assigned": module["is_assigned"],
+                    "is_enabled": module["is_enabled"],
+                    "status": module["status"],
+                }
+            )
+        return usage
+
+    def enable_tenant_module(self, tenant_id, module_code):
+        module_code = self._validate_module_request(tenant_id, module_code)
+        response = self.request(
+            "POST",
+            f"/tenants/{tenant_id}/modules",
+            {"module_code": module_code},
+            authenticated=True,
+        )
+        module = response.get("module")
+        if (
+            response.get("tenant_id") != tenant_id
+            or not isinstance(module, dict)
+            or module.get("code") != module_code
+            or response.get("is_assigned") is not True
+            or response.get("is_enabled") is not True
+            or response.get("status") != "ENABLED"
+        ):
+            raise ApiError(
+                "Respons aktivasi modul Tenant dari Universal API tidak "
+                "valid."
+            )
+        return response
+
+    def disable_tenant_module(self, tenant_id, module_code):
+        module_code = self._validate_module_request(tenant_id, module_code)
+        response = self.request(
+            "DELETE",
+            f"/tenants/{tenant_id}/modules/{module_code}",
+            authenticated=True,
+        )
+        if (
+            response.get("tenant_id") != tenant_id
+            or response.get("module_code") != module_code
+            or response.get("is_assigned") is not True
+            or response.get("is_enabled") is not False
+            or response.get("status") != "DISABLED"
+        ):
+            raise ApiError(
+                "Respons penonaktifan modul Tenant dari Universal API tidak "
+                "valid."
+            )
+        return response
 
     @staticmethod
     def _tenant_identity_payload(code, name, organization_name):

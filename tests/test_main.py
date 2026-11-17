@@ -10,14 +10,20 @@ from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QDialog,
+    QMessageBox,
     QTableWidgetItem,
 )
 
 from main import (
     ConfigurationPage,
+    DashboardLoadWorker,
+    DashboardPage,
     DataPage,
     FormDialog,
+    InstallationPage,
+    LicensePage,
     MainWindow,
+    ModulePage,
     PasswordChangeDialog,
     TenantPage,
     TenantSaveWorker,
@@ -43,6 +49,414 @@ class DesktopApplicationTests(unittest.TestCase):
                 window.pages.currentWidget(), window.page_by_key[page_key]
             )
         self.assertEqual(len(window.menu_buttons), len(MainWindow.MENU))
+
+    def test_dashboard_displays_live_api_counts_and_latest_activity(self):
+        class FakeApiClient:
+            def list_tenants(self):
+                return [{"id": 31}, {"id": 32}]
+
+            def count_tenant_installations(self, tenant_id):
+                return {31: 4, 32: 7}[tenant_id]
+
+            def list_modules(self):
+                return [{"id": 1}, {"id": 2}, {"id": 3}]
+
+            def list_recent_audit_logs(self):
+                return [
+                    {
+                        "created_at": "2026-11-17T00:00:00+00:00",
+                        "action": "TENANT_CREATED",
+                        "entity": "Tenant",
+                        "actor_type": "DEVELOPER",
+                        "actor_id": 1,
+                    }
+                ]
+
+        results = []
+        worker = DashboardLoadWorker(FakeApiClient())
+        worker.loaded.connect(results.append)
+        worker.run()
+
+        page = DashboardPage()
+        self.addCleanup(page.close)
+        page.show_dashboard_data(results[0])
+
+        self.assertEqual(page.stat_values["TOTAL TENANT"].text(), "2")
+        self.assertEqual(page.stat_values["INSTALASI"].text(), "11")
+        self.assertEqual(page.stat_values["MODUL SISTEM"].text(), "3")
+        self.assertEqual(page.stat_values["LISENSI AKTIF"].text(), "N/D")
+        self.assertIn("TENANT_CREATED", page.activity_label.text())
+        self.assertEqual(
+            page.data_status.text(),
+            "DATA DASHBOARD: DIPERBARUI DARI UNIVERSAL API",
+        )
+
+    def test_dashboard_surfaces_api_errors_instead_of_showing_zero(self):
+        page = DashboardPage()
+        self.addCleanup(page.close)
+
+        page.show_dashboard_data(
+            {
+                "counts": {
+                    "tenants": None,
+                    "installations": None,
+                    "modules": 2,
+                },
+                "errors": {
+                    "tenants": "Akses ditolak.",
+                    "installations": "Tenant gagal dimuat.",
+                },
+                "activities": [],
+            }
+        )
+
+        self.assertEqual(page.stat_values["TOTAL TENANT"].text(), "Gagal")
+        self.assertEqual(page.stat_values["INSTALASI"].text(), "Gagal")
+        self.assertEqual(page.stat_values["MODUL SISTEM"].text(), "2")
+        self.assertIn("Akses ditolak", page.data_status.toolTip())
+
+    def test_license_page_uses_api_module_assignment_without_fake_licenses(self):
+        class FakeApiClient:
+            def __init__(self):
+                self.enabled = False
+                self.enable_calls = []
+                self.list_calls = []
+
+            def list_tenant_modules(self, tenant_id):
+                self.list_calls.append(tenant_id)
+                return [
+                    {
+                        "id": 1,
+                        "code": "CORE",
+                        "name": "Core",
+                        "is_active": True,
+                        "is_assigned": True,
+                        "is_enabled": True,
+                        "status": "ENABLED",
+                    },
+                    {
+                        "id": 2,
+                        "code": "SURVEI_GPS",
+                        "name": "Survei GPS",
+                        "is_active": True,
+                        "is_assigned": self.enabled,
+                        "is_enabled": self.enabled,
+                        "status": "ENABLED" if self.enabled else "UNASSIGNED",
+                    },
+                ]
+
+            def enable_tenant_module(self, tenant_id, module_code):
+                self.enable_calls.append((tenant_id, module_code))
+                self.enabled = True
+
+            def disable_tenant_module(self, tenant_id, module_code):
+                self.enabled = False
+
+        api_client = FakeApiClient()
+        page = LicensePage(api_client)
+        self.addCleanup(page.close)
+        self.assertIn(
+            "belum menyediakan model atau endpoint lisensi",
+            page.license_note.text(),
+        )
+
+        page.tenant_id_input.setText("31")
+        page.load_button.click()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(page.table.rowCount(), 2)
+        self.assertEqual(api_client.list_calls, [31])
+        survei_row = next(
+            row
+            for row in range(page.table.rowCount())
+            if page.table.item(row, 0).text() == "SURVEI_GPS"
+        )
+        page.table.selectRow(survei_row)
+        self.assertTrue(page.enable_button.isEnabled())
+        self.assertFalse(page.disable_button.isEnabled())
+
+        page.enable_button.click()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(api_client.enable_calls, [(31, "SURVEI_GPS")])
+        self.assertEqual(page.table.item(survei_row, 2).text(), "ENABLED")
+
+    def test_installation_page_shows_server_list_and_tenant_scoped_detail(self):
+        installation = {
+            "id": 8,
+            "tenant_id": 31,
+            "tenant_code": "TEN-31",
+            "tenant_name": "Tenant One",
+            "installation_key": "do-not-display-key",
+            "device": {
+                "id": "device-8",
+                "name": "Field Laptop",
+                "platform": "windows",
+                "app_version": "1.2.3",
+                "details": {
+                    "os_version": "Windows 11",
+                    "locale": "id-ID",
+                },
+            },
+            "status": "ACTIVE",
+            "first_seen_at": "2026-11-17T00:00:00+00:00",
+            "last_seen_at": "2026-11-17T01:00:00+00:00",
+            "created_at": "2026-11-17T00:00:00+00:00",
+            "updated_at": "2026-11-17T01:00:00+00:00",
+            "deleted_at": None,
+        }
+        revoked_installation = {
+            **installation,
+            "id": 9,
+            "tenant_id": 31,
+            "device": {
+                **installation["device"],
+                "id": "device-9",
+                "name": "Revoked Device",
+            },
+            "status": "REVOKED",
+            "deleted_at": "2026-11-17T02:00:00+00:00",
+        }
+
+        class FakeApiClient:
+            def __init__(self):
+                self.detail_requests = []
+                self.list_requests = []
+
+            def list_installations(self, include_deleted=False):
+                self.list_requests.append(include_deleted)
+                return (
+                    [installation, revoked_installation]
+                    if include_deleted
+                    else [installation]
+                )
+
+            def get_tenant_installation(self, tenant_id, installation_id):
+                self.detail_requests.append((tenant_id, installation_id))
+                return installation
+
+        api_client = FakeApiClient()
+        page = InstallationPage(api_client)
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+        self.assertIsNone(page.add_button)
+        self.assertIsNone(page.edit_button)
+
+        page.load_installations()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 1).text(), "8")
+        self.assertEqual(page.table.item(0, 2).text(), "TEN-31 — Tenant One")
+        self.assertEqual(page.table.item(0, 3).text(), "device-8")
+        self.assertEqual(page.table.item(0, 7).text(), "ACTIVE")
+
+        with patch("main.QMessageBox.exec") as show_detail:
+            page.show_details(0, 0)
+            page.wait_for_load()
+            self.app.processEvents()
+
+        self.assertEqual(api_client.detail_requests, [(31, 8)])
+        self.assertTrue(show_detail.called)
+        detail_dialog = page.findChild(QMessageBox)
+        detail_text = detail_dialog.text()
+        self.assertIn("Tenant: TEN-31 — Tenant One", detail_text)
+        self.assertIn("Platform: windows", detail_text)
+        self.assertIn("os_version: Windows 11", detail_text)
+        self.assertNotIn("do-not-display-key", detail_text)
+
+        page.include_revoked.setChecked(True)
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(api_client.list_requests, [False, True])
+        self.assertEqual(page.table.rowCount(), 2)
+        revoked_row = next(
+            row
+            for row in range(page.table.rowCount())
+            if page.table.item(row, 1).text() == "9"
+        )
+        with patch("main.QMessageBox.exec"):
+            page.show_details(revoked_row, 0)
+        detail_dialog = page.findChildren(QMessageBox)[-1]
+        self.assertIn("Status: REVOKED", detail_dialog.text())
+        self.assertIn("Dihapus: 2026-11-17T02:00:00+00:00", detail_dialog.text())
+        self.assertEqual(api_client.detail_requests, [(31, 8)])
+
+    def test_module_page_loads_catalog_and_tenant_usage_from_api(self):
+        module = {
+            "id": 5,
+            "code": "UMKM",
+            "name": "UMKM",
+            "description": "Business module",
+            "is_active": True,
+            "created_at": "2026-11-17T00:00:00+00:00",
+            "updated_at": "2026-11-17T01:00:00+00:00",
+        }
+
+        class FakeApiClient:
+            def __init__(self):
+                self.detail_requests = []
+                self.usage_requests = []
+
+            def list_modules(self):
+                return [module]
+
+            def get_module(self, module_id):
+                self.detail_requests.append(module_id)
+                return module
+
+            def list_module_tenant_usage(self, module_code):
+                self.usage_requests.append(module_code)
+                return [
+                    {
+                        "tenant_id": 31,
+                        "tenant_code": "TEN-31",
+                        "tenant_name": "Tenant One",
+                        "is_assigned": True,
+                        "is_enabled": True,
+                        "status": "ENABLED",
+                    },
+                    {
+                        "tenant_id": 32,
+                        "tenant_code": "TEN-32",
+                        "tenant_name": "Tenant Two",
+                        "is_assigned": False,
+                        "is_enabled": False,
+                        "status": "UNASSIGNED",
+                    },
+                ]
+
+        api_client = FakeApiClient()
+        page = ModulePage(api_client)
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+
+        page.load_modules()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 2).text(), "UMKM")
+        self.assertEqual(page.table.item(0, 5).text(), "ACTIVE")
+
+        with patch("main.QMessageBox.exec"):
+            page.show_details(0, 0)
+            page.wait_for_load()
+            self.app.processEvents()
+
+        self.assertEqual(api_client.detail_requests, [5])
+        self.assertEqual(api_client.usage_requests, ["UMKM"])
+        detail_dialog = page.findChildren(QMessageBox)[-1]
+        self.assertIn("Status katalog: ACTIVE", detail_dialog.text())
+        self.assertIn("Assignment aktif: 1", detail_dialog.text())
+        self.assertIn("TEN-31 — Tenant One: ENABLED", detail_dialog.text())
+        self.assertIn(
+            "Status katalog, assignment modul, dan lisensi",
+            detail_dialog.text(),
+        )
+
+    def test_module_page_creates_edits_and_changes_catalog_status_via_api(self):
+        class FakeApiClient:
+            def __init__(self):
+                self.modules = []
+                self.calls = []
+
+            def list_modules(self):
+                return list(self.modules)
+
+            def create_module(self, code, name, description):
+                self.calls.append(("create", code, name, description))
+                module = {
+                    "id": 7,
+                    "code": code.upper(),
+                    "name": name,
+                    "description": description,
+                    "is_active": True,
+                    "created_at": "2026-11-17T00:00:00+00:00",
+                    "updated_at": "2026-11-17T00:00:00+00:00",
+                }
+                self.modules.append(module)
+                return module
+
+            def update_module(self, module_id, name, description):
+                self.calls.append(
+                    ("update", module_id, name, description)
+                )
+                module = {
+                    **self.modules[0],
+                    "name": name,
+                    "description": description,
+                }
+                self.modules[0] = module
+                return module
+
+            def set_module_active(self, module_id, is_active):
+                self.calls.append(("status", module_id, is_active))
+                module = {
+                    **self.modules[0],
+                    "is_active": is_active,
+                }
+                self.modules[0] = module
+                return module
+
+        api_client = FakeApiClient()
+        page = ModulePage(api_client)
+        self.addCleanup(page.close)
+        self.addCleanup(page.wait_for_load)
+        dialogs = []
+
+        with patch.object(
+            FormDialog,
+            "exec",
+            new=lambda dialog: dialogs.append(dialog)
+            or QDialog.DialogCode.Rejected,
+        ):
+            page.open_create_form()
+
+        create_dialog = dialogs.pop()
+        self.addCleanup(create_dialog.close)
+        create_dialog.inputs["KODE MODUL"].setText("custom")
+        create_dialog.inputs["NAMA MODUL"].setText("Custom Module")
+        create_dialog.inputs["DESKRIPSI"].setText("Initial description")
+        self.assertTrue(create_dialog.submit_form())
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(
+            api_client.calls[0],
+            ("create", "custom", "Custom Module", "Initial description"),
+        )
+
+        page.table.selectRow(0)
+        self.assertTrue(page.status_button.isEnabled())
+        page.toggle_module_status()
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(api_client.calls[1], ("status", 7, False))
+        self.assertEqual(page.table.item(0, 5).text(), "INACTIVE")
+
+        with patch.object(
+            FormDialog,
+            "exec",
+            new=lambda dialog: dialogs.append(dialog)
+            or QDialog.DialogCode.Rejected,
+        ):
+            page.open_edit_form()
+
+        edit_dialog = dialogs.pop()
+        self.addCleanup(edit_dialog.close)
+        edit_dialog.inputs["NAMA MODUL"].setText("Custom Suite")
+        edit_dialog.inputs["DESKRIPSI"].setText("Updated description")
+        self.assertTrue(edit_dialog.submit_form())
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(
+            api_client.calls[2],
+            ("update", 7, "Custom Suite", "Updated description"),
+        )
+        self.assertEqual(page.table.item(0, 3).text(), "Custom Suite")
 
     def test_search_filter_and_empty_state_follow_table_contents(self):
         page = DataPage(
