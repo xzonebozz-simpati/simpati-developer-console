@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}{{ page_title }} | SIMPATI Developer Console{% endblock %}
+{% block body %}
+{% set data = license_data or {} %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
+    <nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav>
+    <form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form>
+  </aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>{{ page_title }}</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    <section class="section-heading"><div><h2>Penerbitan Serial Key</h2><p class="muted">License Manager menandatangani lisensi dan membuat Serial Key yang dipakai SIMPATI Client Desktop.</p></div></section>
+    {% if errors %}<div class="alert"><strong>Periksa kembali:</strong><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>{% endif %}
+    <section class="client-form-panel">
+      {% if not tenants %}<div class="alert">Tidak ada Tenant atau daftar Tenant gagal dimuat dari Universal API.</div>{% endif %}
+      {% if not packages %}<div class="alert">Belum ada paket aktif yang dapat dipilih.</div>{% endif %}
+      <form method="post" action="{{ form_action }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <div class="form-grid">
+          <div class="form-group full-width">
+            <label for="tenant_id">Tenant *</label>
+            <select id="tenant_id" name="tenant_id" required>
+              <option value="">Pilih Tenant</option>
+              {% for tenant in tenants %}
+              {% set tid = tenant.get('id', tenant.get('tenant_id')) %}
+              <option value="{{ tid }}" {% if data.get('tenant_id', '')|string == tid|string %}selected{% endif %}>{{ tenant.get('name', tenant.get('tenant_name', tenant.get('organization_name', tid))) }} · {{ tenant.get('code', tenant.get('tenant_code', '')) }}{% if tenant.get('status') %} ({{ tenant.status }}){% endif %}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-group full-width">
+            <label for="package_id">Paket *</label>
+            <select id="package_id" name="package_id" required>
+              <option value="">Pilih paket aktif</option>
+              {% for package in packages %}
+              <option value="{{ package.id }}" data-modules="{{ (package.get('modules') or [])|join(',') }}" {% if data.get('package_id', '')|string == package.id|string %}selected{% endif %}>{{ package.get('package_name', package.get('package_code', package.id)) }} · {{ package.get('package_code', '') }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <fieldset class="license-module-picker full-width">
+            <legend>Modul yang disertakan *</legend>
+            {% if modules %}
+            <div class="license-module-grid">
+              {% for module in modules %}
+              <label class="license-module-option">
+                <input type="checkbox" name="modules" value="{{ module.code }}" {% if module.code in data.get('modules', []) %}checked{% endif %}>
+                <span><strong>{{ module.name }}</strong>{% if module.description %}<small>{{ module.description }}</small>{% endif %}</span>
+              </label>
+              {% endfor %}
+            </div>
+            {% else %}<p class="muted">Katalog modul tidak tersedia dari Universal API.</p>{% endif %}
+          </fieldset>
+          <div class="form-group"><label for="valid_from">Mulai berlaku (UTC) *</label><input type="datetime-local" id="valid_from" name="valid_from" required value="{{ data.get('valid_from', '') }}"></div>
+          <div class="form-group"><label for="valid_until">Berakhir pada (UTC) *</label><input type="datetime-local" id="valid_until" name="valid_until" required value="{{ data.get('valid_until', '') }}"></div>
+          <div class="form-group"><label for="grace_period_days">Masa tenggang (hari, maks. 90)</label><input type="number" id="grace_period_days" name="grace_period_days" min="0" max="90" value="{{ data.get('grace_period_days', 7) }}" required></div>
+          <div class="form-group"><label for="max_installations">Batas instalasi desktop</label><input type="number" id="max_installations" name="max_installations" min="1" value="{{ data.get('max_installations', 1) }}" required></div>
+          <div class="form-group"><label for="max_members">Batas anggota</label><input type="number" id="max_members" name="max_members" min="1" value="{{ data.get('max_members', 50000) }}" required></div>
+          <div class="form-group"><label for="max_accounts">Batas akun</label><input type="number" id="max_accounts" name="max_accounts" min="1" value="{{ data.get('max_accounts', 200) }}" required></div>
+          <div class="form-group"><label for="max_concurrent_users">Pengguna bersamaan</label><input type="number" id="max_concurrent_users" name="max_concurrent_users" min="1" value="{{ data.get('max_concurrent_users', 25) }}" required></div>
+          <div class="form-group"><label for="max_storage_mb">Penyimpanan (MB, min. 500)</label><input type="number" id="max_storage_mb" name="max_storage_mb" min="500" value="{{ data.get('max_storage_mb', 20480) }}" required></div>
+          <div class="form-group full-width"><label for="notes">Catatan</label><textarea id="notes" name="notes" rows="3">{{ data.get('notes', '') }}</textarea></div>
+        </div>
+        <div class="form-actions"><a href="/licenses" class="secondary-button">Batal</a><button type="submit" class="primary-button" {% if not tenants or not packages or not modules %}disabled{% endif %}>Terbitkan Lisensi &amp; Serial Key</button></div>
+      </form>
+    </section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+<script>
+  const packageSelect = document.getElementById("package_id");
+  if (packageSelect) {
+    packageSelect.addEventListener("change", () => {
+      const selected = packageSelect.selectedOptions[0];
+      const packageModules = (selected?.dataset.modules || "").split(",").filter(Boolean);
+      if (!packageModules.length) return;
+      document.querySelectorAll('input[name="modules"]').forEach((input) => {
+        input.checked = packageModules.includes(input.value);
+      });
+    });
+  }
+</script>
+{% endblock %}

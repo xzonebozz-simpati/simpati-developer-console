@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Manajemen Lisensi | SIMPATI Developer Console{% endblock %}
+{% block body %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
+    <nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav>
+    <form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form>
+  </aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>Manajemen Lisensi</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    <section class="section-heading"><div><h2>Lisensi seluruh Tenant</h2><p class="muted">Lisensi dan Serial Key dikelola License Manager melalui SIMPATI Universal API.</p></div></section>
+    {% if notice %}<div class="alert success-alert">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert"><strong>Data lisensi belum dapat dimuat:</strong> {{ error }}</div>{% endif %}
+    <section class="client-stat-grid">
+      <article class="client-stat-card"><span>Lisensi ditampilkan</span><strong>{{ counts.total }}</strong></article>
+      <article class="client-stat-card"><span>Aktif</span><strong>{{ counts.active }}</strong></article>
+      <article class="client-stat-card"><span>Ditangguhkan</span><strong>{{ counts.suspended }}</strong></article>
+      <article class="client-stat-card"><span>Dicabut</span><strong>{{ counts.revoked }}</strong></article>
+    </section>
+    <section class="client-toolbar">
+      <form method="get" action="/licenses" class="client-search">
+        <input type="search" name="q" value="{{ keyword }}" placeholder="Cari Serial Key, Tenant, atau paket...">
+        <select name="status_filter">
+          <option value="">Semua status</option>
+          {% for item in ['ACTIVE', 'SUSPENDED', 'REVOKED'] %}<option value="{{ item }}" {% if status_filter == item %}selected{% endif %}>{{ item|capitalize }}</option>{% endfor %}
+        </select>
+        <button type="submit">Cari</button>
+        {% if keyword or status_filter %}<a href="/licenses" class="secondary-button">Reset</a>{% endif %}
+      </form>
+      <a href="/licenses/new" class="primary-button">+ Terbitkan Lisensi</a>
+    </section>
+    <section class="client-table-panel">
+      <div class="table-heading"><div><h2>Daftar Lisensi</h2><p>{{ tenants|length }} Tenant diperiksa melalui Universal API.</p></div></div>
+      <div class="table-responsive">
+        <table class="client-table license-table">
+          <thead><tr><th>Serial Key</th><th>Tenant</th><th>Paket</th><th>Status</th><th>Berlaku sampai</th><th>Aksi</th></tr></thead>
+          <tbody>
+            {% for item in licenses %}
+            {% set license_id = item.get('id', item.get('license_id', '')) %}
+            {% set item_status = item.get('computed_status', item.get('status', 'UNKNOWN'))|upper %}
+            <tr>
+              <td><code>{{ item.get('license_key', 'Serial Key tersedia pada detail')|truncate(24, True, '…') }}</code></td>
+              <td><strong>{{ item.get('tenant_name', '-') }}</strong><small>{{ item.get('tenant_code', '') }}</small></td>
+              <td>{{ item.get('package_name', item.get('package_code', '-')) }}</td>
+              <td><span class="license-status status-{{ item_status|lower }}">{{ item_status|capitalize }}</span></td>
+              <td>{{ item.get('valid_until', '-') }}</td>
+              <td>{% if license_id %}<a href="/licenses/{{ license_id }}?tenant_id={{ item.tenant_id }}">Detail &amp; riwayat</a>{% else %}<span class="muted">ID tidak tersedia</span>{% endif %}</td>
+            </tr>
+            {% else %}
+            <tr><td colspan="6" class="empty-table">{% if error %}Periksa koneksi dan sesi Universal API di atas.{% elif keyword or status_filter %}Tidak ada lisensi yang sesuai filter.{% else %}Belum ada lisensi untuk Tenant yang terdaftar.{% endif %}</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+{% endblock %}

@@ -1,6 +1,6 @@
 /* =========================================
    SIMPATI DEVELOPER CONSOLE
-   CLIENT MANAGEMENT v0.3.0
+   DEVELOPER CONSOLE v0.4.0
 ========================================= */
 
 .client-stat-grid {
@@ -318,7 +318,341 @@
 
 /* RESPONSIVE */
 
+/* LICENSE MANAGEMENT */
+
+body {
+    margin: 0;
+    background: #f7f5f5;
+    color: #333;
+    font-family: Arial, sans-serif;
+}
+
+.app-shell {
+    display: grid;
+    grid-template-columns: 250px minmax(0, 1fr);
+    min-height: 100vh;
+}
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+    padding: 24px 16px;
+    background: #31090e;
+    color: #fff;
+}
+
+.sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 8px;
+}
+
+.sidebar-brand strong,
+.sidebar-brand small {
+    display: block;
+}
+
+.sidebar-brand small {
+    margin-top: 4px;
+    color: #d7bec1;
+    font-size: 10px;
+}
+
+.brand-mark {
+    display: inline-grid;
+    width: 42px;
+    height: 42px;
+    place-items: center;
+    border-radius: 12px;
+    background: #fff;
+    color: #5b1018;
+    font-size: 22px;
+    font-weight: 700;
+}
+
+.brand-mark.small {
+    width: 34px;
+    height: 34px;
+    font-size: 18px;
+}
+
+.sidebar nav {
+    display: grid;
+    gap: 5px;
+}
+
+.nav-item {
+    padding: 11px 12px;
+    border-radius: 7px;
+    color: #f5e9ea;
+    font-size: 13px;
+    text-decoration: none;
+}
+
+.nav-item:hover,
+.nav-item.selected {
+    background: #5b1018;
+    color: #fff;
+}
+
+.logout-form {
+    margin-top: auto;
+}
+
+.logout-button {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #865b60;
+    border-radius: 7px;
+    background: transparent;
+    color: #fff;
+    cursor: pointer;
+}
+
+.main-content {
+    min-width: 0;
+    padding: 28px clamp(18px, 4vw, 52px);
+}
+
+.topbar,
+.section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+}
+
+.topbar h1,
+.section-heading h2 {
+    margin: 4px 0 0;
+    color: #4a1016;
+}
+
+.section-heading {
+    margin: 26px 0 18px;
+}
+
+.section-heading p,
+.muted {
+    color: #777;
+}
+
+.eyebrow {
+    margin: 0;
+    color: #8a6266;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+}
+
+.user-chip {
+    padding: 9px 13px;
+    border: 1px solid #eadfe0;
+    border-radius: 20px;
+    background: #fff;
+    color: #5b1018;
+    font-size: 12px;
+}
+
+.alert {
+    margin: 16px 0;
+    padding: 13px 16px;
+    border: 1px solid #edc9c9;
+    border-radius: 8px;
+    background: #fff0f0;
+    color: #8c252c;
+}
+
+.alert ul {
+    margin-bottom: 0;
+}
+
+.client-stat-grid {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+
+.client-search select,
+.form-group select,
+.form-group input[type="number"],
+.form-group input[type="datetime-local"] {
+    box-sizing: border-box;
+    min-height: 40px;
+    padding: 9px 12px;
+    border: 1px solid #ddd2d3;
+    border-radius: 8px;
+    background: #fff;
+    color: #333;
+    font: inherit;
+}
+
+.form-group select {
+    width: 100%;
+}
+
+.primary-button:disabled {
+    cursor: not-allowed;
+    opacity: .55;
+}
+
+.license-table {
+    min-width: 900px;
+}
+
+.license-table code {
+    color: #5b1018;
+    font-size: 12px;
+}
+
+.license-status {
+    display: inline-block;
+    padding: 6px 10px;
+    border-radius: 20px;
+    background: #f1eeee;
+    color: #655b5c;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+}
+
+.license-status.status-active {
+    background: #e4f5e9;
+    color: #237a40;
+}
+
+.license-status.status-suspended {
+    background: #fff3d8;
+    color: #93640a;
+}
+
+.license-status.status-revoked {
+    background: #fbe8e8;
+    color: #a52b35;
+}
+
+.license-module-picker {
+    min-width: 0;
+    margin: 0;
+    padding: 16px;
+    border: 1px solid #eadfe0;
+    border-radius: 10px;
+}
+
+.license-module-picker legend {
+    padding: 0 6px;
+    color: #4b151a;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.license-module-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 10px;
+}
+
+.license-module-option {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 12px;
+    border: 1px solid #eee7e7;
+    border-radius: 8px;
+    background: #fff;
+}
+
+.license-module-option input {
+    margin-top: 3px;
+}
+
+.license-module-option strong,
+.license-module-option small {
+    display: block;
+}
+
+.license-module-option small {
+    margin-top: 4px;
+    color: #777;
+}
+
+.license-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 22px;
+}
+
+.license-key-control {
+    display: flex;
+    gap: 8px;
+}
+
+.license-key-control input {
+    width: min(45vw, 470px);
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid #ddd2d3;
+    border-radius: 8px;
+    color: #4a1016;
+    font-family: monospace;
+}
+
+.license-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 16px;
+    margin: 20px 0;
+}
+
+.license-actions-grid .client-form-panel h2 {
+    margin: 0 0 16px;
+    color: #5b1018;
+    font-size: 17px;
+}
+
+.license-actions-grid form,
+.license-actions-grid .form-group {
+    display: grid;
+    gap: 12px;
+}
+
+.license-actions-grid .form-group {
+    margin-bottom: 12px;
+}
+
+footer {
+    margin-top: 34px;
+    color: #888;
+    font-size: 12px;
+}
+
 @media (max-width: 768px) {
+
+    .app-shell {
+        grid-template-columns: 1fr;
+    }
+
+    .sidebar {
+        gap: 14px;
+    }
+
+    .sidebar nav {
+        grid-template-columns: repeat(auto-fit, minmax(135px, 1fr));
+    }
+
+    .license-detail-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .license-key-control {
+        align-items: stretch;
+        flex-direction: column;
+        width: 100%;
+    }
+
+    .license-key-control input {
+        width: 100%;
+    }
 
     .client-stat-grid {
         grid-template-columns: 1fr;

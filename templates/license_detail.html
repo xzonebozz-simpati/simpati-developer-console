@@ -1,0 +1,99 @@
+{% extends "base.html" %}
+{% block title %}Detail Lisensi | SIMPATI Developer Console{% endblock %}
+{% block body %}
+{% set item_status = license.get('computed_status', license.get('status', 'UNKNOWN'))|upper %}
+{% set capacity = license.get('capacity') or {} %}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="sidebar-brand"><span class="brand-mark small">S</span><div><strong>SIMPATI</strong><small>DEVELOPER CONSOLE</small></div></div>
+    <nav>{% for item in menu_items %}<a href="{{ item.path }}" class="nav-item {% if active_slug == item.slug %}selected{% endif %}"><span>{{ item.label }}</span></a>{% endfor %}</nav>
+    <form method="post" action="/logout" class="logout-form"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="logout-button" type="submit">Keluar</button></form>
+  </aside>
+  <main class="main-content">
+    <header class="topbar"><div><p class="eyebrow">PUSAT KENDALI PENGEMBANG</p><h1>Detail Lisensi</h1></div><div class="user-chip">Developer: {{ username }}</div></header>
+    <section class="section-heading"><div><h2>{{ license.get('customer_name', license.get('tenant_name', 'Tenant')) }}</h2><p class="muted">{{ license.get('package_name', '-') }} · {{ license.get('license_type', 'COMMERCIAL') }}</p></div><a href="/licenses" class="secondary-button">← Daftar Lisensi</a></section>
+    {% if notice %}<div class="alert success-alert">{{ notice }}</div>{% endif %}
+    {% if error_notice %}<div class="alert">{{ error_notice }}</div>{% endif %}
+    <section class="client-detail-panel">
+      <div class="client-detail-header"><div><span class="license-status status-{{ item_status|lower }}">{{ item_status|capitalize }}</span><strong>Serial Key</strong></div><div class="license-key-control"><input id="license-key" type="text" value="{{ license.get('license_key', '') }}" readonly aria-label="Serial Key"><button class="secondary-button" type="button" id="copy-license-key">Salin Serial Key</button></div></div>
+      <div class="license-detail-grid">
+        <div class="detail-item"><span>ID Lisensi</span><strong>{{ license.get('id', '-') }}</strong></div>
+        <div class="detail-item"><span>Tenant</span><strong>{{ license.get('customer_name', license.get('tenant_name', '-')) }} · {{ license.get('customer_code', license.get('tenant_code', '')) }}</strong></div>
+        <div class="detail-item"><span>Paket</span><strong>{{ license.get('package_name', '-') }}</strong></div>
+        <div class="detail-item"><span>Terbit</span><strong>{{ license.get('issued_at', license.get('created_at', '-')) }}</strong></div>
+        <div class="detail-item"><span>Mulai berlaku</span><strong>{{ license.get('valid_from', '-') }}</strong></div>
+        <div class="detail-item"><span>Berakhir</span><strong>{{ license.get('valid_until', '-') }}</strong></div>
+        <div class="detail-item"><span>Masa tenggang</span><strong>{{ license.get('grace_period_days', 0) }} hari</strong></div>
+        <div class="detail-item"><span>Batas instalasi</span><strong>{{ license.get('max_installations', '-') }}</strong></div>
+        <div class="detail-item"><span>Modul</span><strong>{{ (license.get('modules') or [])|join(', ') or '-' }}</strong></div>
+        <div class="detail-item"><span>Level</span><strong>{{ (license.get('levels') or [])|join(', ') or '-' }}</strong></div>
+        <div class="detail-item"><span>Batas anggota</span><strong>{{ capacity.get('max_members', '-') }}</strong></div>
+        <div class="detail-item"><span>Batas akun</span><strong>{{ capacity.get('max_accounts', '-') }}</strong></div>
+        <div class="detail-item"><span>Pengguna bersamaan</span><strong>{{ capacity.get('max_concurrent_users', '-') }}</strong></div>
+        <div class="detail-item"><span>Penyimpanan</span><strong>{% if capacity.get('max_storage_mb') is not none %}{{ capacity.get('max_storage_mb') }} MB{% else %}-{% endif %}</strong></div>
+        <div class="detail-item"><span>Validasi tanda tangan</span><strong>{% if license.get('signature_valid') is sameas true %}Valid{% elif license.get('signature_valid') is sameas false %}Tidak valid{% else %}Tidak tersedia{% endif %}</strong></div>
+        <div class="detail-item"><span>Catatan</span><strong>{{ license.get('notes') or '-' }}</strong></div>
+      </div>
+    </section>
+    <section class="license-actions-grid">
+      <article class="client-form-panel">
+        <h2>Perpanjang lisensi</h2>
+        <form method="post" action="/licenses/{{ license.id }}/extend">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="tenant_id" value="{{ tenant_id }}">
+          <div class="form-group"><label for="extend-until">Tanggal berakhir baru (UTC) *</label><input id="extend-until" type="datetime-local" name="valid_until" required></div>
+          <div class="form-group"><label for="extend-reason">Alasan *</label><textarea id="extend-reason" name="reason" minlength="3" required rows="2"></textarea></div>
+          <button type="submit" class="primary-button">Simpan perpanjangan</button>
+        </form>
+      </article>
+      <article class="client-form-panel">
+        <h2>Atur masa berlaku</h2>
+        <form method="post" action="/licenses/{{ license.id }}/validity">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="tenant_id" value="{{ tenant_id }}">
+          <div class="form-group"><label for="valid-from">Mulai (UTC) *</label><input id="valid-from" type="datetime-local" name="valid_from" value="{{ license.get('valid_from', '')[:16] }}" required></div>
+          <div class="form-group"><label for="valid-until">Berakhir (UTC) *</label><input id="valid-until" type="datetime-local" name="valid_until" value="{{ license.get('valid_until', '')[:16] }}" required></div>
+          <div class="form-group"><label for="grace-period">Masa tenggang (hari, kosongkan untuk tetap)</label><input id="grace-period" type="number" name="grace_period_days" min="0" max="90" placeholder="{{ license.get('grace_period_days', 0) }}"></div>
+          <div class="form-group"><label for="validity-reason">Alasan *</label><textarea id="validity-reason" name="reason" minlength="3" required rows="2"></textarea></div>
+          <button type="submit" class="primary-button">Perbarui masa berlaku</button>
+        </form>
+      </article>
+      <article class="client-form-panel">
+        <h2>Ubah status lisensi</h2>
+        <form method="post" action="/licenses/{{ license.id }}/status">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="tenant_id" value="{{ tenant_id }}">
+          <div class="form-group"><label for="license-status">Status *</label><select id="license-status" name="status" required>{% for value in statuses %}<option value="{{ value }}" {% if item_status == value %}selected{% endif %}>{{ value|capitalize }}</option>{% endfor %}</select></div>
+          <div class="form-group"><label for="status-reason">Alasan *</label><textarea id="status-reason" name="reason" minlength="3" required rows="2"></textarea></div>
+          <button type="submit" class="primary-button">Perbarui status</button>
+        </form>
+      </article>
+    </section>
+    <section class="client-table-panel">
+      <div class="table-heading"><div><h2>Riwayat lisensi</h2><p>Riwayat perubahan dari License Manager.</p></div></div>
+      <div class="table-responsive"><table class="client-table">
+        <thead><tr><th>Waktu</th><th>Aksi</th><th>Pengguna</th><th>Catatan</th></tr></thead>
+        <tbody>
+          {% for event in license.get('history') or [] %}
+          <tr><td>{{ event.get('created_at', '-') }}</td><td>{{ event.get('action', '-') }}</td><td>{{ event.get('performed_by_name', '-') or '-' }}</td><td>{{ event.get('remarks', '-') or '-' }}</td></tr>
+          {% else %}<tr><td colspan="4" class="empty-table">Belum ada riwayat perubahan.</td></tr>{% endfor %}
+        </tbody>
+      </table></div>
+    </section>
+    <footer>© 2026 SIMPATI Universal · Developer Console</footer>
+  </main>
+</div>
+<script>
+  const copyButton = document.getElementById("copy-license-key");
+  if (copyButton) {
+    copyButton.addEventListener("click", async () => {
+      const keyInput = document.getElementById("license-key");
+      try {
+        await navigator.clipboard.writeText(keyInput.value);
+        copyButton.textContent = "Tersalin";
+      } catch {
+        keyInput.select();
+        document.execCommand("copy");
+        copyButton.textContent = "Tersalin";
+      }
+    });
+  }
+</script>
+{% endblock %}
