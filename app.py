@@ -8,6 +8,8 @@ from urllib.parse import quote
 
 import httpx
 
+import httpx
+
 from fastapi import FastAPI, Form, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -16,7 +18,11 @@ from starlette.middleware.sessions import SessionMiddleware
 
 
 BASE_DIR = Path(__file__).resolve().parent
+<<<<<<< HEAD
 APP_VERSION = "0.3.2"
+=======
+APP_VERSION = "0.3.1"
+>>>>>>> 7648c8b7835e267d5fe883c82b1bc8cfae6860f0
 
 app = FastAPI(
     title="SIMPATI Developer Console",
@@ -815,6 +821,7 @@ async def client_change_status(
         )
 
 
+<<<<<<< HEAD
 
 # =========================================================
 # DATA INSTALASI
@@ -1166,6 +1173,8 @@ async def installation_change_status(
         return RedirectResponse(f"/installations/{installation_id}?notice={quote(str(exc), safe='')}", status_code=status.HTTP_303_SEE_OTHER)
 
 
+=======
+>>>>>>> 7648c8b7835e267d5fe883c82b1bc8cfae6860f0
 # =========================================================
 # MENU LAIN YANG MASIH DALAM PENGEMBANGAN
 # =========================================================
@@ -1189,7 +1198,11 @@ def create_module_page(module):
 
 
 for item in MENU_ITEMS:
+<<<<<<< HEAD
     if item["slug"] in ("dashboard", "clients", "installations"):
+=======
+    if item["slug"] in ("dashboard", "clients"):
+>>>>>>> 7648c8b7835e267d5fe883c82b1bc8cfae6860f0
         continue
 
     app.add_api_route(

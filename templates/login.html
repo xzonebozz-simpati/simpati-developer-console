@@ -12,6 +12,7 @@
       <div class="alert">Akun belum dikonfigurasi. Atur DEVELOPER_USERNAME, DEVELOPER_PASSWORD, dan SESSION_SECRET pada environment aplikasi.</div>
     {% endif %}
     <form method="post" action="/login">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
       <label for="username">Nama pengguna</label>
       <input id="username" name="username" autocomplete="username" required>
       <label for="password">Kata sandi</label>

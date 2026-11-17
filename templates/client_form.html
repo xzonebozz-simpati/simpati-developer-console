@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+
+{% block title %}{{ page_title }} | SIMPATI Developer Console{% endblock %}
+
+{% block body %}
+{% set data = client or {} %}
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <span class="brand-mark small">S</span>
+      <div>
+        <strong>SIMPATI</strong>
+        <small>DEVELOPER CONSOLE</small>
+      </div>
+    </div>
+
+    <nav>
+      {% for item in menu_items %}
+      <a href="{{ item.path }}"
+         class="nav-item {% if active_slug == item.slug %}selected{% endif %}">
+        <span>{{ item.label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="logout-button" type="submit">Keluar</button>
+    </form>
+  </aside>
+
+  <main class="main-content">
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PUSAT KENDALI PENGEMBANG</p>
+        <h1>{{ page_title }}</h1>
+      </div>
+      <div class="user-chip">Developer: {{ username }}</div>
+    </header>
+
+    <section class="section-heading">
+      <div>
+        <h2>Informasi Klien</h2>
+        <p class="muted">
+          Lengkapi informasi organisasi atau pelanggan SIMPATI.
+        </p>
+      </div>
+    </section>
+
+    {% if errors %}
+    <div class="alert">
+      <strong>Periksa kembali data berikut:</strong>
+      <ul>
+        {% for item in errors %}
+        <li>{{ item }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <section class="client-form-panel">
+
+      <form method="post" action="{{ form_action }}">
+
+        <input type="hidden" name="csrf_token"
+               value="{{ csrf_token }}">
+
+        <div class="form-grid">
+
+          <div class="form-group">
+            <label for="client_code">Kode Klien *</label>
+            <input type="text" id="client_code"
+                   name="client_code"
+                   value="{{ data.get('client_code', '') }}"
+                   maxlength="50" required>
+          </div>
+
+          <div class="form-group">
+            <label for="client_name">Nama Organisasi *</label>
+            <input type="text" id="client_name"
+                   name="client_name"
+                   value="{{ data.get('client_name', '') }}"
+                   maxlength="150" required>
+          </div>
+
+          <div class="form-group">
+            <label for="contact_person">Penanggung Jawab</label>
+            <input type="text" id="contact_person"
+                   name="contact_person"
+                   value="{{ data.get('contact_person', '') }}">
+          </div>
+
+          <div class="form-group">
+            <label for="email">Email</label>
+            <input type="email" id="email"
+                   name="email"
+                   value="{{ data.get('email', '') }}">
+          </div>
+
+          <div class="form-group">
+            <label for="phone">Nomor Telepon</label>
+            <input type="text" id="phone"
+                   name="phone"
+                   value="{{ data.get('phone', '') }}">
+          </div>
+
+          <div class="form-group full-width">
+            <label for="address">Alamat</label>
+            <textarea id="address" name="address"
+                      rows="3">{{ data.get('address', '') }}</textarea>
+          </div>
+
+          <div class="form-group full-width">
+            <label for="notes">Catatan</label>
+            <textarea id="notes" name="notes"
+                      rows="4">{{ data.get('notes', '') }}</textarea>
+          </div>
+
+        </div>
+
+        <div class="form-actions">
+          <a href="/clients" class="secondary-button">Batal</a>
+          <button type="submit" class="primary-button">
+            Simpan Data Klien
+          </button>
+        </div>
+
+      </form>
+
+    </section>
+
+    <footer>
+      © 2026 SIMPATI Universal · Developer Console
+    </footer>
+
+  </main>
+</div>
+
+{% endblock %}

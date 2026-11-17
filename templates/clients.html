@@ -1,0 +1,201 @@
+{% extends "base.html" %}
+
+{% block title %}Manajemen Klien | SIMPATI Developer Console{% endblock %}
+
+{% block body %}
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+
+    <div class="sidebar-brand">
+      <span class="brand-mark small">S</span>
+      <div>
+        <strong>SIMPATI</strong>
+        <small>DEVELOPER CONSOLE</small>
+      </div>
+    </div>
+
+    <nav>
+      {% for item in menu_items %}
+      <a href="{{ item.path }}"
+         class="nav-item {% if active_slug == item.slug %}selected{% endif %}">
+        <span>{{ item.label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+
+    <form method="post" action="/logout" class="logout-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <button class="logout-button" type="submit">Keluar</button>
+    </form>
+
+  </aside>
+
+  <main class="main-content">
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PUSAT KENDALI PENGEMBANG</p>
+        <h1>Manajemen Klien</h1>
+      </div>
+
+      <div class="user-chip">
+        Developer: {{ username }}
+      </div>
+    </header>
+
+    <section class="section-heading">
+      <div>
+        <h2>Data Klien SIMPATI</h2>
+        <p class="muted">
+          Pengelolaan organisasi dan pelanggan ekosistem SIMPATI Universal.
+        </p>
+      </div>
+    </section>
+
+    {% if notice %}
+    <div class="alert success-alert">
+      {{ notice }}
+    </div>
+    {% endif %}
+
+    {% if error %}
+    <div class="alert">
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <section class="client-stat-grid">
+
+      <article class="client-stat-card">
+        <span>Total Klien</span>
+        <strong>{{ total_count }}</strong>
+      </article>
+
+      <article class="client-stat-card">
+        <span>Klien Aktif</span>
+        <strong>{{ active_count }}</strong>
+      </article>
+
+      <article class="client-stat-card">
+        <span>Klien Nonaktif</span>
+        <strong>{{ inactive_count }}</strong>
+      </article>
+
+    </section>
+
+    <section class="client-toolbar">
+
+      <form method="get" action="/clients" class="client-search">
+        <input
+          type="search"
+          name="q"
+          value="{{ keyword }}"
+          placeholder="Cari nama atau kode klien..."
+        >
+
+        <button type="submit">Cari</button>
+
+        {% if keyword %}
+        <a href="/clients" class="secondary-button">Reset</a>
+        {% endif %}
+      </form>
+
+      <a href="/clients/new" class="primary-button">
+        + Tambah Klien
+      </a>
+
+    </section>
+
+    <section class="client-table-panel">
+
+      <div class="table-heading">
+        <div>
+          <h2>Daftar Klien</h2>
+          <p>Data tersimpan pada database SIMPATI Console.</p>
+        </div>
+      </div>
+
+      <div class="table-responsive">
+
+        <table class="client-table">
+
+          <thead>
+            <tr>
+              <th>Kode Klien</th>
+              <th>Nama Organisasi</th>
+              <th>Kontak</th>
+              <th>Telepon</th>
+              <th>Status</th>
+              <th>Aksi</th>
+            </tr>
+          </thead>
+
+          <tbody>
+
+            {% for client in clients %}
+
+            <tr>
+
+              <td>
+                <strong>{{ client.client_code }}</strong>
+              </td>
+
+              <td>
+                <strong>{{ client.client_name }}</strong>
+                <small>{{ client.email or '-' }}</small>
+              </td>
+
+              <td>{{ client.contact_person or '-' }}</td>
+
+              <td>{{ client.phone or '-' }}</td>
+
+              <td>
+                {% if client.status == 'active' %}
+                <span class="client-status active">Aktif</span>
+                {% else %}
+                <span class="client-status inactive">Nonaktif</span>
+                {% endif %}
+              </td>
+
+              <td>
+                <div class="client-actions">
+                  <a href="/clients/{{ client.id }}">Detail</a>
+                  <a href="/clients/{{ client.id }}/edit">Edit</a>
+                </div>
+              </td>
+
+            </tr>
+
+            {% else %}
+
+            <tr>
+              <td colspan="6" class="empty-table">
+                {% if keyword %}
+                  Klien dengan kata kunci tersebut tidak ditemukan.
+                {% else %}
+                  Belum ada data klien. Silakan tambahkan klien pertama.
+                {% endif %}
+              </td>
+            </tr>
+
+            {% endfor %}
+
+          </tbody>
+
+        </table>
+
+      </div>
+
+    </section>
+
+    <footer>
+      © 2026 SIMPATI Universal · Developer Console
+    </footer>
+
+  </main>
+
+</div>
+
+{% endblock %}

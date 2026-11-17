@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+
+{% block title %}
+{{ module.label }} | SIMPATI Developer Console
+{% endblock %}
+
+{% block body %}
+
+<div class="app-shell">
+
+  <aside class="sidebar">
+
+    <div class="sidebar-brand">
+      <span class="brand-mark small">S</span>
+      <div>
+        <strong>SIMPATI</strong>
+        <small>DEVELOPER CONSOLE</small>
+      </div>
+    </div>
+
+    <nav>
+      {% for item in menu_items %}
+      <a href="{{ item.path }}"
+         class="nav-item {% if active_slug == item.slug %}selected{% endif %}">
+        <span>{{ item.label }}</span>
+      </a>
+      {% endfor %}
+    </nav>
+
+    <form method="post" action="/logout" class="logout-form">
+      <button class="logout-button" type="submit">Keluar</button>
+    </form>
+
+  </aside>
+
+  <main class="main-content">
+
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">PUSAT KENDALI PENGEMBANG</p>
+        <h1>{{ module.label }}</h1>
+      </div>
+
+      <div class="user-chip">
+        Developer: {{ username }}
+      </div>
+    </header>
+
+    <section class="section-heading">
+      <div>
+        <h2>{{ module.label }}</h2>
+        <p class="muted">{{ module.description }}</p>
+      </div>
+    </section>
+
+    <section class="welcome-panel">
+      <div>
+        <p class="eyebrow light">SIMPATI UNIVERSAL</p>
+
+        <h2>Modul sedang disiapkan</h2>
+
+        <p>
+          Halaman {{ module.label }} sudah tersedia dalam navigasi
+          Developer Console. Fitur pengelolaannya akan dikembangkan
+          pada tahap berikutnya.
+        </p>
+      </div>
+
+      <span class="status-pill">Dalam pengembangan</span>
+    </section>
+
+    <section class="system-grid">
+
+      <article class="system-card">
+        <span class="card-index">INFO</span>
+        <h3>Status Modul</h3>
+        <p>Struktur halaman sudah tersedia.</p>
+        <span class="tag">Belum diaktifkan</span>
+      </article>
+
+      <article class="system-card">
+        <span class="card-index">NEXT</span>
+        <h3>Pengembangan Fitur</h3>
+        <p>Fungsi operasional akan ditambahkan bertahap.</p>
+        <span class="tag">Direncanakan</span>
+      </article>
+
+    </section>
+
+    <footer>
+      © 2026 SIMPATI Universal · Developer Console
+    </footer>
+
+  </main>
+
+</div>
+
+{% endblock %}
