@@ -39,8 +39,8 @@ tidak mengakses database atau License Manager secara langsung.
   Waktu respons tiap pemeriksaan data ditampilkan pada detail metrik.
   Status database hanya berasal dari `/health/ready`; Dashboard tidak
   menyimpulkannya dari `/health/live`. Jika request gagal, status dan detail
-  error ditampilkan; kartu lisensi tetap `N/D` karena API belum menyediakan
-  endpoint lisensi.
+  error ditampilkan; kartu lisensi Dashboard tetap `N/D` karena Dashboard
+  belum menghitung daftar lisensi per-Tenant.
 - Menu Audit Log membaca `GET /auth/audit-logs` dengan permission
   `auth.audit.read`. Endpoint mendukung `limit` dan `offset` (maksimal 100)
   serta parameter opsional `tenant_id`; daftar diurutkan terbaru lebih dulu.
@@ -140,39 +140,40 @@ tidak mengakses database atau License Manager secara langsung.
 - Field `EMAIL KONTAK` lama tetap ditampilkan, tetapi penyimpanan ditolak jika
   field tersebut diisi karena kontrak Tenant Universal API tidak menyediakan
   field email kontak.
-- Menu Lisensi menggunakan `GET /tenants/{tenant_id}/modules`,
-  `POST /tenants/{tenant_id}/modules`, dan
-  `DELETE /tenants/{tenant_id}/modules/{module_code}` hanya untuk membaca
-  serta mengubah assignment modul Tenant. Permission backend masing-masing
-  adalah `tenant.modules.read` dan `tenant.modules.manage`. Assignment modul
-  bukan lisensi dan tidak memberi atau memvalidasi hak lisensi.
+- Menu Lisensi memakai proxy Universal API ke License Manager:
+  pilihan Tenant diambil dari daftar `GET /tenants` Universal API, terpisah
+  dari daftar lisensi agar Tenant tanpa lisensi tetap dapat dipilih untuk
+  penerbitan. Desktop tidak membuat atau menyimpan salinan Tenant.
+  `GET /licenses?tenant_id=...`, `GET /licenses/{license_id}?tenant_id=...`,
+  katalog `GET /licenses/packages` dan `GET /licenses/modules`, serta
+  penerbitan `POST /licenses`. Perpanjangan memakai
+  `POST /licenses/{license_id}/extend?tenant_id=...`; masa berlaku dan status
+  memakai `PATCH /licenses/{license_id}/validity?tenant_id=...` dan
+  `PATCH /licenses/{license_id}/status?tenant_id=...`. Semua request
+  menggunakan access token Developer dari autentikasi Universal API.
+  Operasi baca memerlukan `tenants.read`; perubahan dan penerbitan memerlukan
+  `tenants.manage`. Desktop juga memerlukan `tenants.read` saat menerbitkan
+  untuk memuat katalog paket dan modul.
+- Penerbitan memilih paket serta modul dan menetapkan masa berlaku, masa
+  tenggang, batas instalasi, anggota, akun, pengguna bersamaan, dan
+  penyimpanan. License Manager tetap menjadi sumber data lisensi dan Serial
+  Key; Desktop tidak menyimpan salinan lisensi. Serial Key hanya diterima pada
+  respons penerbitan, ditampilkan untuk disalin saat itu, lalu tidak tersedia
+  kembali dari endpoint daftar, detail, atau perubahan.
+- Tidak ada endpoint riwayat khusus lisensi. Menu Lisensi memuat
+  `GET /auth/audit-logs?tenant_id=...` dengan permission `auth.audit.read`,
+  memfilter catatan `License` per ID lisensi di Desktop, dan memuat halaman
+  sampai habis karena endpoint tidak mengembalikan total atau filter
+  aktivitas. Ini menampilkan audit yang tersedia, bukan snapshot entitlements.
+  Endpoint API juga belum mendukung perubahan paket/modul/batas kapasitas
+  setelah penerbitan, penghapusan lisensi, atau pengambilan ulang Serial Key.
+  Paket, modul, dan kapasitas hanya dapat ditetapkan pada penerbitan.
+  Assignment modul Tenant melalui `/tenants/{tenant_id}/modules` tetap
+  terpisah dan tidak memberikan hak lisensi.
 - Endpoint dan payload autentikasi mengikuti kontrak SIMPATI Universal API.
   Menu dan fitur Desktop dipertahankan. Operasi Tenant menggunakan client API
   yang sama; operasi data lain, termasuk lisensi, harus melalui Universal API,
   bukan database Desktop atau License Manager langsung.
-
-## Kebutuhan pengembangan SIMPATI Universal API: Lisensi
-
-Pemeriksaan API saat ini menemukan model assignment modul (`TenantModule`),
-tetapi tidak menemukan model Lisensi, router, atau endpoint pengelolaan lisensi.
-API utama juga tidak memasang router License Manager. Karena itu Desktop tidak
-membuat daftar atau menyimpan data lisensi lokal.
-
-Backend perlu menyediakan kontrak dan model lisensi yang mendukung:
-
-- Membaca dan membuat lisensi untuk Tenant dengan ID dan paket yang valid.
-- Mengubah atau menetapkan masa berlaku dan batas penggunaan.
-- Membaca serta mengubah status lisensi dengan aturan transisi yang jelas.
-- Mengaitkan modul yang diotorisasi ke lisensi, tanpa menyamakan assignment
-  modul Tenant yang sudah ada dengan hak lisensi.
-- Validasi kepemilikan Tenant, paket, rentang tanggal, batas penggunaan, status,
-  dan modul; otorisasi berbasis permission serta audit untuk perubahan.
-- Kontrak pagination/filter untuk daftar, bentuk respons/error yang stabil,
-  dan endpoint baca/detail serta operasi create/update yang terdokumentasi.
-
-Setelah kontrak tersebut tersedia, Desktop dapat mengimplementasikan
-pengelolaan lisensi tanpa menyentuh database atau License Manager secara
-langsung.
 
 ## Persiapan dan menjalankan
 

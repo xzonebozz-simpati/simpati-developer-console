@@ -2,9 +2,11 @@ import hashlib
 import ipaddress
 import json
 import re
+from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
+from uuid import UUID
 
 import keyring
 from keyring.errors import KeyringError
@@ -95,6 +97,8 @@ class ApiClient:
     API_SERVICE_PATH = "/health/live"
     TENANT_PAGE_SIZE = 100
     INSTALLATION_PAGE_SIZE = 100
+    LICENSE_PAGE_SIZE = 50
+    LICENSE_CATALOG_PAGE_SIZE = 100
 
     def __init__(self, base_url="", token_store=None):
         self.token_store = token_store or SecureTokenStore()
@@ -687,6 +691,383 @@ class ApiClient:
                 "Respons audit log dari Universal API tidak valid."
             )
         return response
+
+    @staticmethod
+    def _validate_license_tenant_id(tenant_id):
+        if type(tenant_id) is not int or tenant_id < 1:
+            raise ApiError("ID Tenant untuk lisensi tidak valid.")
+
+    @staticmethod
+    def _validate_license_uuid(value, label):
+        if not isinstance(value, str):
+            raise ApiError(f"{label} lisensi tidak valid.")
+        try:
+            return str(UUID(value))
+        except ValueError as exc:
+            raise ApiError(f"{label} lisensi tidak valid.") from exc
+
+    @staticmethod
+    def _license_datetime(value, label):
+        if not isinstance(value, str):
+            raise ApiError(f"{label} lisensi tidak valid.")
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ApiError(f"{label} lisensi tidak valid.") from exc
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    @staticmethod
+    def _validate_license_response(response, description):
+        if not isinstance(response, dict):
+            raise ApiError(
+                f"Respons {description} dari Universal API tidak valid."
+            )
+        return response
+
+    def list_license_modules(self):
+        response = self.request(
+            "GET", "/licenses/modules", authenticated=True
+        )
+        modules = response.get("items")
+        if (
+            not isinstance(modules, list)
+            or any(
+                not isinstance(module, dict)
+                or not isinstance(module.get("module_code"), str)
+                or not module["module_code"]
+                or type(module.get("is_active")) is not bool
+                for module in modules
+            )
+        ):
+            raise ApiError(
+                "Respons katalog modul lisensi dari Universal API tidak valid."
+            )
+        return modules
+
+    def list_license_packages(self, limit=100, offset=0):
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ApiError("Jumlah paket lisensi yang diminta tidak valid.")
+        if type(offset) is not int or offset < 0:
+            raise ApiError("Offset daftar paket lisensi tidak valid.")
+        query = urlencode({"limit": limit, "offset": offset})
+        response = self.request(
+            "GET", f"/licenses/packages?{query}", authenticated=True
+        )
+        packages = response.get("items")
+        if (
+            not isinstance(packages, list)
+            or len(packages) > limit
+            or any(
+                not isinstance(package, dict)
+                or not isinstance(package.get("id"), str)
+                for package in packages
+            )
+            or response.get("limit") != limit
+            or response.get("offset") != offset
+        ):
+            raise ApiError(
+                "Respons daftar paket lisensi dari Universal API tidak valid."
+            )
+        for package in packages:
+            self._validate_license_uuid(package["id"], "ID paket")
+        return response
+
+    def get_license_package(self, package_id):
+        package_id = self._validate_license_uuid(package_id, "ID paket")
+        package = self._validate_license_response(
+            self.request(
+                "GET",
+                f"/licenses/packages/{package_id}",
+                authenticated=True,
+            ),
+            "detail paket lisensi",
+        )
+        returned_package_id = package.get("id")
+        if (
+            not isinstance(returned_package_id, str)
+            or self._validate_license_uuid(
+                returned_package_id, "ID paket"
+            )
+            != package_id
+        ):
+            raise ApiError(
+                "Respons detail paket lisensi dari Universal API tidak valid."
+            )
+        package_modules = package.get("package_modules")
+        if (
+            not isinstance(package_modules, list)
+            or any(
+                not isinstance(module, dict)
+                or not isinstance(module.get("module_code"), str)
+                or not module["module_code"]
+                for module in package_modules
+            )
+        ):
+            raise ApiError(
+                "Respons modul paket lisensi dari Universal API tidak valid."
+            )
+        return package
+
+    def list_tenant_licenses(
+        self,
+        tenant_id,
+        limit=50,
+        offset=0,
+        package_id=None,
+        status_filter=None,
+    ):
+        self._validate_license_tenant_id(tenant_id)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ApiError("Jumlah lisensi yang diminta tidak valid.")
+        if type(offset) is not int or offset < 0:
+            raise ApiError("Offset daftar lisensi tidak valid.")
+        params = {
+            "tenant_id": tenant_id,
+            "limit": limit,
+            "offset": offset,
+        }
+        if package_id is not None:
+            params["package_id"] = self._validate_license_uuid(
+                package_id, "ID paket"
+            )
+        if status_filter is not None:
+            if not isinstance(status_filter, str) or not status_filter.strip():
+                raise ApiError("Filter status lisensi tidak valid.")
+            params["status_filter"] = status_filter.strip()
+        response = self.request(
+            "GET",
+            f"/licenses?{urlencode(params)}",
+            authenticated=True,
+        )
+        licenses = response.get("items")
+        if (
+            not isinstance(licenses, list)
+            or len(licenses) > limit
+            or any(not isinstance(license_data, dict) for license_data in licenses)
+            or response.get("limit") != limit
+            or response.get("offset") != offset
+        ):
+            raise ApiError(
+                "Respons daftar lisensi dari Universal API tidak valid."
+            )
+        for license_data in licenses:
+            license_id = license_data.get("id") or license_data.get(
+                "license_id"
+            )
+            self._validate_license_uuid(license_id, "ID")
+        return response
+
+    def get_tenant_license(self, tenant_id, license_id):
+        self._validate_license_tenant_id(tenant_id)
+        license_id = self._validate_license_uuid(license_id, "ID")
+        query = urlencode({"tenant_id": tenant_id})
+        response = self._validate_license_response(
+            self.request(
+                "GET",
+                f"/licenses/{license_id}?{query}",
+                authenticated=True,
+            ),
+            "detail lisensi",
+        )
+        returned_id = response.get("id") or response.get("license_id")
+        if (
+            returned_id is not None
+            and self._validate_license_uuid(returned_id, "ID") != license_id
+        ):
+            raise ApiError(
+                "Respons detail lisensi dari Universal API tidak valid."
+            )
+        return response
+
+    def create_tenant_license(
+        self,
+        tenant_id,
+        package_id,
+        valid_from,
+        valid_until,
+        modules,
+        max_installations,
+        max_members,
+        max_accounts,
+        max_concurrent_users,
+        max_storage_mb,
+        grace_period_days=7,
+        notes=None,
+    ):
+        self._validate_license_tenant_id(tenant_id)
+        package_id = self._validate_license_uuid(package_id, "ID paket")
+        valid_from_utc = self._license_datetime(valid_from, "Tanggal mulai")
+        valid_until_utc = self._license_datetime(valid_until, "Tanggal akhir")
+        if valid_until_utc <= valid_from_utc:
+            raise ApiError("Masa berlaku lisensi harus berakhir setelah dimulai.")
+        if (
+            not isinstance(modules, list)
+            or any(not isinstance(code, str) or not code for code in modules)
+            or len(modules) != len(set(modules))
+        ):
+            raise ApiError("Pilihan modul lisensi tidak valid.")
+        capacities = {
+            "max_installations": (max_installations, 1),
+            "max_members": (max_members, 1),
+            "max_accounts": (max_accounts, 1),
+            "max_concurrent_users": (max_concurrent_users, 1),
+            "max_storage_mb": (max_storage_mb, 500),
+        }
+        if any(
+            type(value) is not int or value < minimum
+            for value, minimum in capacities.values()
+        ):
+            raise ApiError("Batas kapasitas lisensi tidak valid.")
+        if (
+            type(grace_period_days) is not int
+            or not 0 <= grace_period_days <= 90
+        ):
+            raise ApiError("Masa tenggang lisensi tidak valid.")
+        if notes is not None and not isinstance(notes, str):
+            raise ApiError("Catatan lisensi tidak valid.")
+        payload = {
+            "tenant_id": tenant_id,
+            "package_id": package_id,
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+            "modules": modules,
+            "max_installations": max_installations,
+            "grace_period_days": grace_period_days,
+            "capacity": {
+                "max_members": max_members,
+                "max_accounts": max_accounts,
+                "max_concurrent_users": max_concurrent_users,
+                "max_storage_mb": max_storage_mb,
+            },
+        }
+        if notes:
+            payload["notes"] = notes
+        response = self._validate_license_response(
+            self.request(
+                "POST", "/licenses", payload, authenticated=True
+            ),
+            "penerbitan lisensi",
+        )
+        license_id = response.get("license_id") or response.get("id")
+        license_id = self._validate_license_uuid(
+            license_id, "ID lisensi"
+        )
+        serial_key = response.get("license_key")
+        if not isinstance(serial_key, str) or not serial_key:
+            raise ApiError(
+                "Respons penerbitan lisensi tidak berisi Serial Key yang valid."
+            )
+        return response
+
+    def extend_tenant_license(
+        self, tenant_id, license_id, valid_until, reason
+    ):
+        self._validate_license_tenant_id(tenant_id)
+        license_id = self._validate_license_uuid(license_id, "ID")
+        self._license_datetime(valid_until, "Tanggal perpanjangan")
+        if not isinstance(reason, str) or len(reason.strip()) < 3:
+            raise ApiError("Alasan perpanjangan minimal 3 karakter.")
+        query = urlencode({"tenant_id": tenant_id})
+        response = self._validate_license_response(
+            self.request(
+                "POST",
+                f"/licenses/{license_id}/extend?{query}",
+                {
+                    "valid_until": valid_until,
+                    "reason": reason.strip(),
+                },
+                authenticated=True,
+            ),
+            "perpanjangan lisensi",
+        )
+        return response
+
+    def update_tenant_license_validity(
+        self,
+        tenant_id,
+        license_id,
+        valid_from,
+        valid_until,
+        reason,
+        grace_period_days=None,
+    ):
+        self._validate_license_tenant_id(tenant_id)
+        license_id = self._validate_license_uuid(license_id, "ID")
+        valid_from_utc = self._license_datetime(valid_from, "Tanggal mulai")
+        valid_until_utc = self._license_datetime(valid_until, "Tanggal akhir")
+        if valid_until_utc <= valid_from_utc:
+            raise ApiError("Masa berlaku lisensi harus berakhir setelah dimulai.")
+        if not isinstance(reason, str) or len(reason.strip()) < 3:
+            raise ApiError("Alasan perubahan minimal 3 karakter.")
+        payload = {
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+            "reason": reason.strip(),
+        }
+        if grace_period_days is not None:
+            if (
+                type(grace_period_days) is not int
+                or not 0 <= grace_period_days <= 90
+            ):
+                raise ApiError("Masa tenggang lisensi tidak valid.")
+            payload["grace_period_days"] = grace_period_days
+        query = urlencode({"tenant_id": tenant_id})
+        return self._validate_license_response(
+            self.request(
+                "PATCH",
+                f"/licenses/{license_id}/validity?{query}",
+                payload,
+                authenticated=True,
+            ),
+            "perubahan masa berlaku lisensi",
+        )
+
+    def update_tenant_license_status(
+        self, tenant_id, license_id, status, reason
+    ):
+        self._validate_license_tenant_id(tenant_id)
+        license_id = self._validate_license_uuid(license_id, "ID")
+        if not isinstance(status, str) or status not in {
+            "ACTIVE",
+            "SUSPENDED",
+            "REVOKED",
+        }:
+            raise ApiError("Status lisensi tidak valid.")
+        if not isinstance(reason, str) or len(reason.strip()) < 3:
+            raise ApiError("Alasan perubahan status minimal 3 karakter.")
+        query = urlencode({"tenant_id": tenant_id})
+        return self._validate_license_response(
+            self.request(
+                "PATCH",
+                f"/licenses/{license_id}/status?{query}",
+                {"status": status, "reason": reason.strip()},
+                authenticated=True,
+            ),
+            "perubahan status lisensi",
+        )
+
+    def list_license_history(self, tenant_id, license_id):
+        self._validate_license_tenant_id(tenant_id)
+        license_id = self._validate_license_uuid(license_id, "ID")
+        history = []
+        offset = 0
+        while True:
+            page = self.list_audit_logs(
+                limit=100, offset=offset, tenant_id=tenant_id
+            )
+            logs = page["items"]
+            history.extend(
+                log
+                for log in logs
+                if log["entity"] == "License"
+                and log["entity_id"] == license_id
+                and log["action"].startswith("LICENSE_")
+            )
+            if len(logs) < 100:
+                return history
+            offset += len(logs)
 
     def list_recent_audit_logs(self, limit=5):
         return self.list_audit_logs(limit=limit, offset=0)["items"]

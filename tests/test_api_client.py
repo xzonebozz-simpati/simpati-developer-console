@@ -957,6 +957,227 @@ class ApiClientTests(unittest.TestCase):
             with self.assertRaisesRegex(ApiError, "audit log"):
                 self.client.list_audit_logs()
 
+    def test_license_list_uses_tenant_filter_and_pagination_contract(self):
+        license_id = "e536cdd2-9952-4c33-9caf-789df6477bbb"
+        response = {
+            "items": [{"id": license_id, "status": "ACTIVE"}],
+            "limit": 50,
+            "offset": 100,
+        }
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            result = self.client.list_tenant_licenses(
+                31, limit=50, offset=100, status_filter="ACTIVE"
+            )
+
+        self.assertEqual(result, response)
+        request.assert_called_once_with(
+            "GET",
+            "/licenses?tenant_id=31&limit=50&offset=100&status_filter=ACTIVE",
+            authenticated=True,
+        )
+
+    def test_license_catalog_methods_use_universal_api_contract(self):
+        package_id = "58dd22e7-35a2-43c2-9d8c-e34c480d5908"
+        package = {
+            "id": package_id,
+            "is_active": True,
+            "package_modules": [
+                {"module_code": "CORE", "is_mandatory": True}
+            ],
+        }
+        with patch.object(
+            self.client,
+            "request",
+            side_effect=[
+                {
+                    "items": [{"id": package_id}],
+                    "limit": 100,
+                    "offset": 0,
+                },
+                {"items": [{"module_code": "CORE", "is_active": True}]},
+                package,
+            ],
+        ) as request:
+            packages = self.client.list_license_packages()
+            modules = self.client.list_license_modules()
+            detail = self.client.get_license_package(package_id)
+
+        self.assertEqual(packages["items"][0]["id"], package_id)
+        self.assertEqual(modules[0]["module_code"], "CORE")
+        self.assertEqual(detail, package)
+        self.assertEqual(
+            [item.args[1] for item in request.call_args_list],
+            [
+                "/licenses/packages?limit=100&offset=0",
+                "/licenses/modules",
+                f"/licenses/packages/{package_id}",
+            ],
+        )
+
+    def test_license_creation_sends_capacity_and_returns_one_time_key(self):
+        package_id = "58dd22e7-35a2-43c2-9d8c-e34c480d5908"
+        license_id = "e536cdd2-9952-4c33-9caf-789df6477bbb"
+        serial_key = "SMP-LIC-2026-0123456789ABCDEF-FEDCBA9876543210"
+        response = {"license_id": license_id, "license_key": serial_key}
+        with patch.object(
+            self.client, "request", return_value=response
+        ) as request:
+            result = self.client.create_tenant_license(
+                31,
+                package_id,
+                "2026-01-01T00:00:00Z",
+                "2027-01-01T00:00:00Z",
+                ["CORE", "SURVEI_GPS"],
+                3,
+                1000,
+                25,
+                12,
+                10240,
+            )
+
+        self.assertEqual(result, response)
+        request.assert_called_once_with(
+            "POST",
+            "/licenses",
+            {
+                "tenant_id": 31,
+                "package_id": package_id,
+                "valid_from": "2026-01-01T00:00:00Z",
+                "valid_until": "2027-01-01T00:00:00Z",
+                "modules": ["CORE", "SURVEI_GPS"],
+                "max_installations": 3,
+                "grace_period_days": 7,
+                "capacity": {
+                    "max_members": 1000,
+                    "max_accounts": 25,
+                    "max_concurrent_users": 12,
+                    "max_storage_mb": 10240,
+                },
+            },
+            authenticated=True,
+        )
+
+    def test_license_mutations_use_tenant_scoped_endpoints(self):
+        license_id = "e536cdd2-9952-4c33-9caf-789df6477bbb"
+        with patch.object(
+            self.client,
+            "request",
+            return_value={"status": "ACTIVE"},
+        ) as request:
+            self.client.extend_tenant_license(
+                31, license_id, "2028-01-01T00:00:00Z", "Renewed"
+            )
+            self.client.update_tenant_license_validity(
+                31,
+                license_id,
+                "2026-01-01T00:00:00Z",
+                "2028-01-01T00:00:00Z",
+                "Corrected dates",
+                14,
+            )
+            self.client.update_tenant_license_status(
+                31, license_id, "SUSPENDED", "Compliance review"
+            )
+
+        self.assertEqual(
+            [
+                (call.args[0], call.args[1], call.args[2])
+                for call in request.call_args_list
+            ],
+            [
+                (
+                    "POST",
+                    f"/licenses/{license_id}/extend?tenant_id=31",
+                    {
+                        "valid_until": "2028-01-01T00:00:00Z",
+                        "reason": "Renewed",
+                    },
+                ),
+                (
+                    "PATCH",
+                    f"/licenses/{license_id}/validity?tenant_id=31",
+                    {
+                        "valid_from": "2026-01-01T00:00:00Z",
+                        "valid_until": "2028-01-01T00:00:00Z",
+                        "reason": "Corrected dates",
+                        "grace_period_days": 14,
+                    },
+                ),
+                (
+                    "PATCH",
+                    f"/licenses/{license_id}/status?tenant_id=31",
+                    {"status": "SUSPENDED", "reason": "Compliance review"},
+                ),
+            ],
+        )
+
+    def test_license_history_filters_all_tenant_audit_pages_by_license(self):
+        license_id = "e536cdd2-9952-4c33-9caf-789df6477bbb"
+        matching = {
+            "entity": "License",
+            "entity_id": license_id,
+            "action": "LICENSE_STATUS_UPDATED",
+        }
+        unrelated = {
+            "entity": "Tenant",
+            "entity_id": "31",
+            "action": "TENANT_UPDATED",
+        }
+        with patch.object(
+            self.client,
+            "list_audit_logs",
+            side_effect=[
+                {
+                    "items": [dict(unrelated) for _ in range(100)],
+                    "limit": 100,
+                    "offset": 0,
+                },
+                {
+                    "items": [dict(matching)],
+                    "limit": 100,
+                    "offset": 100,
+                },
+            ],
+        ) as list_logs:
+            result = self.client.list_license_history(31, license_id)
+
+        self.assertEqual(result, [matching])
+        self.assertEqual(
+            list_logs.call_args_list,
+            [
+                call(limit=100, offset=0, tenant_id=31),
+                call(limit=100, offset=100, tenant_id=31),
+            ],
+        )
+
+    def test_license_inputs_reject_invalid_bounds_and_status(self):
+        with patch.object(self.client, "request") as request:
+            with self.assertRaisesRegex(ApiError, "ID Tenant"):
+                self.client.list_tenant_licenses(0)
+            with self.assertRaisesRegex(ApiError, "berakhir"):
+                self.client.create_tenant_license(
+                    31,
+                    "58dd22e7-35a2-43c2-9d8c-e34c480d5908",
+                    "2027-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
+                    ["CORE"],
+                    1,
+                    1,
+                    1,
+                    1,
+                    500,
+                )
+            with self.assertRaisesRegex(ApiError, "Status lisensi"):
+                self.client.update_tenant_license_status(
+                    31,
+                    "e536cdd2-9952-4c33-9caf-789df6477bbb",
+                    "INACTIVE",
+                    "Reason",
+                )
+        request.assert_not_called()
+
     def test_tenant_module_listing_uses_supported_assignment_endpoint(self):
         module = {
             "id": 2,

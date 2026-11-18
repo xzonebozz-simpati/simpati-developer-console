@@ -5,7 +5,7 @@ import time
 from datetime import date, datetime
 
 from api_client import ApiClient, ApiError
-from PySide6.QtCore import Qt, QSettings, QThread, QTimer, Signal
+from PySide6.QtCore import Qt, QDateTime, QSettings, QThread, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,11 +24,14 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QPlainTextEdit,
     QScrollArea,
+    QSpinBox,
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QDateTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -985,15 +988,609 @@ class TenantModuleWorker(QThread):
             self.loaded.emit(modules, success_message)
 
 
-class LicensePage(QWidget):
-    def __init__(self, api_client=None):
+class LicenseRequestWorker(QThread):
+    loaded = Signal(str, object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, operation, **values):
         super().__init__()
         self.api_client = api_client
+        self.operation = operation
+        self.values = values
+
+    def run(self):
+        try:
+            if self.operation == "tenants":
+                result = self.api_client.list_tenants()
+            elif self.operation == "licenses":
+                result = self.api_client.list_tenant_licenses(
+                    self.values["tenant_id"],
+                    limit=self.values["limit"],
+                    offset=self.values["offset"],
+                )
+            elif self.operation == "catalogs":
+                packages = []
+                offset = 0
+                while True:
+                    page = self.api_client.list_license_packages(
+                        limit=100, offset=offset
+                    )
+                    items = page["items"]
+                    packages.extend(items)
+                    if len(items) < 100:
+                        break
+                    offset += len(items)
+                result = {
+                    "packages": packages,
+                    "modules": self.api_client.list_license_modules(),
+                }
+            elif self.operation == "detail":
+                result = self.api_client.get_tenant_license(
+                    self.values["tenant_id"], self.values["license_id"]
+                )
+            elif self.operation == "history":
+                result = self.api_client.list_license_history(
+                    self.values["tenant_id"], self.values["license_id"]
+                )
+            elif self.operation == "create":
+                result = self.api_client.create_tenant_license(
+                    **self.values
+                )
+            elif self.operation == "extend":
+                result = self.api_client.extend_tenant_license(
+                    **self.values
+                )
+            elif self.operation == "validity":
+                result = self.api_client.update_tenant_license_validity(
+                    **self.values
+                )
+            elif self.operation == "status":
+                result = self.api_client.update_tenant_license_status(
+                    **self.values
+                )
+            else:
+                self.failed.emit("Operasi lisensi tidak dikenal.")
+                return
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(self.operation, result)
+
+
+class LicensePackageWorker(QThread):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, api_client, package_id, parent=None):
+        super().__init__(parent)
+        self.api_client = api_client
+        self.package_id = package_id
+
+    def run(self):
+        try:
+            package = self.api_client.get_license_package(self.package_id)
+        except ApiError as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.loaded.emit(package)
+
+
+def _license_record_id(record):
+    return record.get("id") or record.get("license_id")
+
+
+def _sanitize_license_display(value):
+    secret_fields = {
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "clientsecret",
+        "password",
+        "refreshtoken",
+        "secret",
+        "serialkey",
+        "licensekey",
+        "snapshotentitlements",
+        "token",
+    }
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if (
+                normalized in secret_fields
+                or "token" in normalized
+                or "secret" in normalized
+                or "serialkey" in normalized
+                or "licensekey" in normalized
+                or "snapshotentitlements" in normalized
+            ):
+                continue
+            sanitized[key] = _sanitize_license_display(item)
+        return sanitized
+    if isinstance(value, list):
+        return [_sanitize_license_display(item) for item in value]
+    if isinstance(value, str):
+        return re.sub(
+            r"\bSMP-LIC-\d{4}-[A-F0-9]{16}-[A-F0-9]{16}\b",
+            "[REDACTED]",
+            value,
+            flags=re.IGNORECASE,
+        )
+    return value
+
+
+def _date_time_edit(value=None, default=None):
+    edit = QDateTimeEdit()
+    edit.setCalendarPopup(True)
+    edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+    parsed = (
+        QDateTime.fromString(value, Qt.DateFormat.ISODate)
+        if isinstance(value, str)
+        else QDateTime()
+    )
+    edit.setDateTime(
+        parsed if parsed.isValid() else default or QDateTime.currentDateTime()
+    )
+    return edit
+
+
+class LicenseIssueDialog(QDialog):
+    def __init__(self, api_client, tenant_id, packages, modules, parent=None):
+        super().__init__(parent)
+        self.api_client = api_client
+        self.tenant_id = tenant_id
+        self.modules = modules
+        self.package_worker = None
+        self.package_detail = None
+        self.setWindowTitle("Terbitkan Lisensi")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.addWidget(make_title("Terbitkan Lisensi"))
+        note = QLabel(
+            "Paket, modul, dan batas kapasitas menjadi snapshot lisensi saat "
+            "diterbitkan; API belum menyediakan perubahan setelah penerbitan."
+        )
+        note.setObjectName("subtleText")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        form = QFormLayout()
+        self.package_input = QComboBox()
+        for package in packages:
+            package_id = package["id"]
+            label = package.get("name") or package.get("package_name")
+            self.package_input.addItem(
+                f"{label} ({package_id})" if label else package_id,
+                package_id,
+            )
+        self.package_input.currentIndexChanged.connect(
+            self.load_package_modules
+        )
+        form.addRow("Paket", self.package_input)
+        self.valid_from = _date_time_edit(
+            default=QDateTime.currentDateTime()
+        )
+        self.valid_until = _date_time_edit(
+            default=QDateTime.currentDateTime().addYears(1)
+        )
+        form.addRow("Berlaku mulai", self.valid_from)
+        form.addRow("Berlaku sampai", self.valid_until)
+        self.grace_period = self._spin_box(0, 90, 7)
+        integer_limit = 2147483647
+        self.max_installations = self._spin_box(1, integer_limit, 1)
+        self.max_members = self._spin_box(1, integer_limit, 50000)
+        self.max_accounts = self._spin_box(1, integer_limit, 200)
+        self.max_concurrent_users = self._spin_box(1, integer_limit, 25)
+        self.max_storage_mb = self._spin_box(500, integer_limit, 20480)
+        form.addRow("Masa tenggang (hari)", self.grace_period)
+        form.addRow("Batas instalasi", self.max_installations)
+        form.addRow("Batas anggota", self.max_members)
+        form.addRow("Batas akun", self.max_accounts)
+        form.addRow("Pengguna bersamaan", self.max_concurrent_users)
+        form.addRow("Penyimpanan (MB)", self.max_storage_mb)
+        self.notes_input = QLineEdit()
+        self.notes_input.setPlaceholderText("Opsional")
+        form.addRow("Catatan", self.notes_input)
+        layout.addLayout(form)
+
+        module_label = QLabel("Modul yang disertakan")
+        module_label.setObjectName("statLabel")
+        layout.addWidget(module_label)
+        self.module_list = QListWidget()
+        self.module_list.setMaximumHeight(150)
+        layout.addWidget(self.module_list)
+        self.package_status = QLabel("Memuat modul paket...")
+        self.package_status.setObjectName("subtleText")
+        self.package_status.setWordWrap(True)
+        layout.addWidget(self.package_status)
+        self.validation_message = QLabel()
+        self.validation_message.setStyleSheet("color:#A32323;")
+        self.validation_message.setWordWrap(True)
+        layout.addWidget(self.validation_message)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(
+            "Terbitkan"
+        )
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.submit_button = buttons.button(
+            QDialogButtonBox.StandardButton.Ok
+        )
+        self.package_input.setEnabled(bool(packages))
+        self.submit_button.setEnabled(False)
+        if packages:
+            self.load_package_modules()
+        else:
+            self.package_status.setText("Tidak ada paket aktif dari API.")
+
+    @staticmethod
+    def _spin_box(minimum, maximum, value):
+        spin = QSpinBox()
+        spin.setRange(minimum, maximum)
+        spin.setValue(value)
+        return spin
+
+    def load_package_modules(self, *_):
+        package_id = self.package_input.currentData()
+        if not package_id or self.package_worker and self.package_worker.isRunning():
+            return
+        self.package_detail = None
+        self.module_list.clear()
+        self.package_status.setText("Memuat modul paket dari Universal API...")
+        self.submit_button.setEnabled(False)
+        self.package_input.setEnabled(False)
+        self.package_worker = LicensePackageWorker(
+            self.api_client, package_id, self
+        )
+        self.package_worker.loaded.connect(self._show_package_modules)
+        self.package_worker.failed.connect(self._package_load_failed)
+        self.package_worker.finished.connect(self._package_load_finished)
+        self.package_worker.start()
+
+    def _show_package_modules(self, package):
+        self.package_detail = package
+        modules_by_code = {
+            module["module_code"]: module for module in self.modules
+        }
+        selectable = 0
+        mandatory_unavailable = False
+        for package_module in package["package_modules"]:
+            code = package_module["module_code"]
+            module = modules_by_code.get(code)
+            label = (
+                module.get("name", code)
+                if module is not None
+                else code
+            )
+            mandatory = package_module.get("is_mandatory") is True
+            active = module is not None and module.get("is_active") is True
+            if mandatory and not active:
+                mandatory_unavailable = True
+            suffix = " — wajib" if mandatory else ""
+            if not active:
+                suffix += " — tidak aktif di katalog"
+            item = QListWidgetItem(f"{label} ({code}){suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, code)
+            flags = item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+            if not active or mandatory:
+                flags &= ~Qt.ItemFlag.ItemIsEnabled
+            item.setFlags(flags)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if mandatory
+                else Qt.CheckState.Unchecked
+            )
+            self.module_list.addItem(item)
+            if active:
+                selectable += 1
+        self.package_status.setText(
+            "Modul wajib tidak dapat dilepas."
+            if not mandatory_unavailable
+            else "Paket memiliki modul wajib yang tidak aktif di katalog."
+        )
+        self.submit_button.setEnabled(
+            bool(package["package_modules"])
+            and selectable > 0
+            and not mandatory_unavailable
+            and self.valid_until.dateTime() > self.valid_from.dateTime()
+        )
+
+    def _package_load_failed(self, message):
+        self.package_status.setText("Gagal memuat modul paket: " + message)
+        self.validation_message.setText(message)
+        self.validation_message.setVisible(True)
+
+    def _package_load_finished(self):
+        self.package_input.setEnabled(True)
+
+    def _accept_if_valid(self):
+        if self.package_detail is None:
+            self.validation_message.setText(
+                "Paket dan modul belum selesai dimuat."
+            )
+            return
+        if self.valid_until.dateTime() <= self.valid_from.dateTime():
+            self.validation_message.setText(
+                "Tanggal akhir harus setelah tanggal mulai."
+            )
+            return
+        selected = [
+            self.module_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.module_list.count())
+            if self.module_list.item(row).checkState()
+            == Qt.CheckState.Checked
+        ]
+        if not selected:
+            self.validation_message.setText(
+                "Pilih sedikitnya satu modul untuk lisensi."
+            )
+            return
+        self.accept()
+
+    def values(self):
+        modules = [
+            self.module_list.item(row).data(Qt.ItemDataRole.UserRole)
+            for row in range(self.module_list.count())
+            if self.module_list.item(row).checkState()
+            == Qt.CheckState.Checked
+        ]
+        return {
+            "tenant_id": self.tenant_id,
+            "package_id": self.package_input.currentData(),
+            "valid_from": self.valid_from.dateTime().toString(
+                Qt.DateFormat.ISODate
+            ),
+            "valid_until": self.valid_until.dateTime().toString(
+                Qt.DateFormat.ISODate
+            ),
+            "modules": modules,
+            "max_installations": self.max_installations.value(),
+            "max_members": self.max_members.value(),
+            "max_accounts": self.max_accounts.value(),
+            "max_concurrent_users": self.max_concurrent_users.value(),
+            "max_storage_mb": self.max_storage_mb.value(),
+            "grace_period_days": self.grace_period.value(),
+            "notes": self.notes_input.text().strip() or None,
+        }
+
+    def wait_for_load(self):
+        if self.package_worker and self.package_worker.isRunning():
+            self.package_worker.wait()
+
+
+class LicenseMutationDialog(QDialog):
+    def __init__(self, action, license_record, parent=None):
+        super().__init__(parent)
+        self.action = action
+        self.license_record = license_record
+        titles = {
+            "extend": "Perpanjang Lisensi",
+            "validity": "Ubah Masa Berlaku",
+            "status": "Ubah Status Lisensi",
+        }
+        self.setWindowTitle(titles[action])
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        layout.addWidget(make_title(titles[action]))
+        form = QFormLayout()
+        default_from = _date_time_edit().dateTime()
+        default_until = default_from.addYears(1)
+        if action in ("extend", "validity"):
+            self.valid_until = _date_time_edit(
+                license_record.get("valid_until"), default_until
+            )
+            form.addRow("Berlaku sampai", self.valid_until)
+        if action == "validity":
+            self.valid_from = _date_time_edit(
+                license_record.get("valid_from"), default_from
+            )
+            form.insertRow(0, "Berlaku mulai", self.valid_from)
+            self.grace_period = LicenseIssueDialog._spin_box(0, 90, 7)
+            grace = license_record.get("grace_period_days")
+            if type(grace) is int and 0 <= grace <= 90:
+                self.grace_period.setValue(grace)
+            form.addRow("Masa tenggang (hari)", self.grace_period)
+        if action == "status":
+            self.status_input = QComboBox()
+            self.status_input.addItems(
+                ["ACTIVE", "SUSPENDED", "REVOKED"]
+            )
+            current_status = license_record.get("status")
+            if current_status in ("ACTIVE", "SUSPENDED", "REVOKED"):
+                self.status_input.setCurrentText(current_status)
+            form.addRow("Status", self.status_input)
+        self.reason_input = QLineEdit()
+        self.reason_input.setPlaceholderText("Minimal 3 karakter")
+        form.addRow("Alasan", self.reason_input)
+        layout.addLayout(form)
+        self.validation_message = QLabel()
+        self.validation_message.setStyleSheet("color:#A32323;")
+        layout.addWidget(self.validation_message)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Simpan")
+        buttons.accepted.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _accept_if_valid(self):
+        if len(self.reason_input.text().strip()) < 3:
+            self.validation_message.setText(
+                "Alasan perubahan minimal 3 karakter."
+            )
+            return
+        if self.action == "validity" and (
+            self.valid_until.dateTime() <= self.valid_from.dateTime()
+        ):
+            self.validation_message.setText(
+                "Tanggal akhir harus setelah tanggal mulai."
+            )
+            return
+        self.accept()
+
+    def values(self):
+        reason = self.reason_input.text().strip()
+        if self.action == "extend":
+            return {
+                "valid_until": self.valid_until.dateTime().toString(
+                    Qt.DateFormat.ISODate
+                ),
+                "reason": reason,
+            }
+        if self.action == "validity":
+            return {
+                "valid_from": self.valid_from.dateTime().toString(
+                    Qt.DateFormat.ISODate
+                ),
+                "valid_until": self.valid_until.dateTime().toString(
+                    Qt.DateFormat.ISODate
+                ),
+                "grace_period_days": self.grace_period.value(),
+                "reason": reason,
+            }
+        return {"status": self.status_input.currentText(), "reason": reason}
+
+
+class LicenseDetailsDialog(QDialog):
+    def __init__(self, title, data, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(680, 480)
+        layout = QVBoxLayout(self)
+        details = QPlainTextEdit()
+        details.setReadOnly(True)
+        details.setPlainText(
+            json.dumps(
+                _sanitize_license_display(data),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        layout.addWidget(details)
+        close_button = QPushButton("Tutup")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+
+class LicenseIssuedDialog(QDialog):
+    def __init__(self, license_id, serial_key, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Lisensi Berhasil Diterbitkan")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        layout.addWidget(make_title("Lisensi Berhasil Diterbitkan"))
+        note = QLabel(
+            f"ID lisensi: {license_id}\n"
+            "Serial Key hanya tersedia pada respons penerbitan ini. Salin "
+            "sekarang; Universal API tidak menyediakan pengambilan ulang."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.serial_key_input = QLineEdit(serial_key)
+        self.serial_key_input.setReadOnly(True)
+        self.serial_key_input.setClearButtonEnabled(False)
+        layout.addWidget(self.serial_key_input)
+        buttons = QHBoxLayout()
+        copy_button = QPushButton("Salin Serial Key")
+        copy_button.clicked.connect(
+            lambda: QApplication.clipboard().setText(
+                self.serial_key_input.text()
+            )
+        )
+        close_button = QPushButton("Tutup")
+        close_button.setObjectName("secondaryButton")
+        close_button.clicked.connect(self.accept)
+        buttons.addWidget(copy_button)
+        buttons.addStretch()
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def clear_key(self):
+        self.serial_key_input.clear()
+
+
+class LicenseHistoryDialog(QDialog):
+    def __init__(self, history, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Riwayat Lisensi")
+        self.resize(820, 460)
+        layout = QVBoxLayout(self)
+        note = QLabel(
+            "Riwayat berasal dari Audit Log Universal API dan difilter "
+            "berdasarkan ID lisensi."
+        )
+        note.setObjectName("subtleText")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.table = QTableWidget(len(history), 4)
+        self.table.setHorizontalHeaderLabels(
+            ["WAKTU", "AKTIVITAS", "AKTOR", "DETAIL"]
+        )
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, log in enumerate(history):
+            values = (
+                log["created_at"],
+                log["action"],
+                f"{log['actor_type']} #{log['actor_id'] or '—'}",
+                json.dumps(
+                    _sanitize_license_display(log["details"]),
+                    ensure_ascii=False,
+                ),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(value))
+                self.table.setItem(row, column, item)
+        layout.addWidget(self.table, 1)
+        if not history:
+            empty = QLabel("Belum ada riwayat lisensi pada Audit Log.")
+            empty.setObjectName("emptyState")
+            layout.addWidget(empty)
+        close_button = QPushButton("Tutup")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+
+class LicensePage(QWidget):
+    PAGE_SIZE = 50
+
+    def __init__(self, api_client=None, user=None):
+        super().__init__()
+        self.api_client = api_client
+        self.permissions = None
+        self.set_user_permissions(user)
         self.worker = None
+        self.issue_dialog = None
         self.request_pending = False
+        self.pending_operation = None
+        self.pending_result = None
+        self.pending_error = None
         self.loaded_tenant_id = None
-        self.pending_tenant_id = None
-        self.modules_by_code = {}
+        self.tenant_id = None
+        self.tenants = []
+        self.tenants_by_id = {}
+        self.offset = 0
+        self.licenses = []
+        self.license_by_id = {}
+        self.catalogs = None
+        self.mutation_succeeded = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(30, 25, 30, 25)
@@ -1001,58 +1598,75 @@ class LicensePage(QWidget):
         layout.addWidget(make_title("Manajemen Lisensi"))
 
         self.license_note = QLabel(
-            "Universal API saat ini belum menyediakan model atau endpoint "
-            "lisensi. Daftar dan pembuatan lisensi, masa berlaku, paket, "
-            "batas penggunaan, serta status lisensi belum dapat dikelola "
-            "melalui Desktop."
+            "Lisensi dan Serial Key dikelola License Manager melalui "
+            "Universal API. Batas dan modul hanya dapat ditetapkan saat "
+            "penerbitan; API belum menyediakan perubahan entitlements "
+            "setelahnya atau endpoint riwayat khusus."
         )
         self.license_note.setObjectName("subtleText")
         self.license_note.setWordWrap(True)
         layout.addWidget(self.license_note)
 
-        module_title = QLabel("OTORISASI MODUL TENANT")
-        module_title.setObjectName("statLabel")
-        layout.addWidget(module_title)
-        module_note = QLabel(
-            "Bagian ini mengelola assignment modul yang tersedia di API; "
-            "assignment bukan lisensi dan tidak memberikan hak validasi "
-            "lisensi."
+        tenant_toolbar = QHBoxLayout()
+        tenant_toolbar.addWidget(QLabel("Tenant"))
+        self.tenant_selector = QComboBox()
+        self.tenant_selector.addItem("Muat daftar Tenant", None)
+        self.tenant_selector.currentIndexChanged.connect(
+            self._tenant_changed
         )
-        module_note.setObjectName("subtleText")
-        module_note.setWordWrap(True)
-        layout.addWidget(module_note)
+        tenant_toolbar.addWidget(self.tenant_selector, 1)
+        self.load_tenants_button = QPushButton("Muat Tenant")
+        self.load_tenants_button.clicked.connect(self.load_tenants)
+        tenant_toolbar.addWidget(self.load_tenants_button)
+        self.load_button = QPushButton("Muat Lisensi")
+        self.load_button.clicked.connect(self.load_licenses)
+        tenant_toolbar.addWidget(self.load_button)
+        self.issue_button = QPushButton("Terbitkan Lisensi")
+        self.issue_button.setToolTip(
+            "Memerlukan tenants.manage dan tenants.read untuk katalog."
+        )
+        self.issue_button.clicked.connect(self.open_issue_dialog)
+        tenant_toolbar.addWidget(self.issue_button)
+        tenant_toolbar.addStretch()
+        layout.addLayout(tenant_toolbar)
 
-        toolbar = QHBoxLayout()
-        self.tenant_id_input = QLineEdit()
-        self.tenant_id_input.setPlaceholderText("ID Tenant")
-        self.tenant_id_input.setMaximumWidth(180)
-        self.tenant_id_input.textChanged.connect(
-            self.update_action_buttons
+        actions_toolbar = QHBoxLayout()
+        self.detail_button = QPushButton("Detail")
+        self.detail_button.setObjectName("secondaryButton")
+        self.detail_button.clicked.connect(
+            lambda: self._run_selected_operation("detail")
         )
-        toolbar.addWidget(QLabel("Tenant ID"))
-        toolbar.addWidget(self.tenant_id_input)
-        self.load_button = QPushButton("Muat Modul")
-        self.load_button.clicked.connect(self.load_modules)
-        toolbar.addWidget(self.load_button)
-        self.enable_button = QPushButton("Aktifkan Assignment")
-        self.enable_button.setEnabled(False)
-        self.enable_button.clicked.connect(
-            lambda: self.change_selected_module("enable")
+        actions_toolbar.addWidget(self.detail_button)
+        self.history_button = QPushButton("Riwayat")
+        self.history_button.setObjectName("secondaryButton")
+        self.history_button.clicked.connect(
+            lambda: self._run_selected_operation("history")
         )
-        toolbar.addWidget(self.enable_button)
-        self.disable_button = QPushButton("Nonaktifkan Assignment")
-        self.disable_button.setObjectName("secondaryButton")
-        self.disable_button.setEnabled(False)
-        self.disable_button.clicked.connect(
-            lambda: self.change_selected_module("disable")
+        actions_toolbar.addWidget(self.history_button)
+        self.status_button = QPushButton("Ubah Status")
+        self.status_button.setObjectName("secondaryButton")
+        self.status_button.clicked.connect(
+            lambda: self.open_mutation_dialog("status")
         )
-        toolbar.addWidget(self.disable_button)
-        toolbar.addStretch()
-        layout.addLayout(toolbar)
+        actions_toolbar.addWidget(self.status_button)
+        self.validity_button = QPushButton("Ubah Masa Berlaku")
+        self.validity_button.setObjectName("secondaryButton")
+        self.validity_button.clicked.connect(
+            lambda: self.open_mutation_dialog("validity")
+        )
+        actions_toolbar.addWidget(self.validity_button)
+        self.extend_button = QPushButton("Perpanjang")
+        self.extend_button.setObjectName("secondaryButton")
+        self.extend_button.clicked.connect(
+            lambda: self.open_mutation_dialog("extend")
+        )
+        actions_toolbar.addWidget(self.extend_button)
+        actions_toolbar.addStretch()
+        layout.addLayout(actions_toolbar)
 
-        self.table = QTableWidget(0, 3)
+        self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["KODE MODUL", "NAMA MODUL", "STATUS ASSIGNMENT"]
+            ["ID LISENSI", "PAKET", "STATUS", "BERLAKU MULAI", "BERLAKU SAMPAI"]
         )
         self.table.setMinimumHeight(230)
         self.table.setAlternatingRowColors(True)
@@ -1068,165 +1682,474 @@ class LicensePage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
-        self.table.itemSelectionChanged.connect(
-            self.update_action_buttons
-        )
+        self.table.itemSelectionChanged.connect(self.update_action_buttons)
         layout.addWidget(self.table, 1)
 
         self.empty_label = QLabel(
-            "Masukkan ID Tenant lalu muat daftar assignment modul dari API."
+            "Muat daftar Tenant dari Universal API, lalu pilih Tenant."
         )
         self.empty_label.setObjectName("emptyState")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_label.setWordWrap(True)
         self.empty_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.empty_label)
-        self.data_status = make_status_label(
-            "STATUS MODUL: BELUM DIMUAT"
-        )
+        pagination = QHBoxLayout()
+        self.previous_button = QPushButton("Sebelumnya")
+        self.previous_button.setObjectName("secondaryButton")
+        self.previous_button.clicked.connect(self.previous_page)
+        self.page_label = QLabel("Halaman belum dimuat")
+        self.page_label.setObjectName("subtleText")
+        self.next_button = QPushButton("Berikutnya")
+        self.next_button.setObjectName("secondaryButton")
+        self.next_button.clicked.connect(self.next_page)
+        pagination.addWidget(self.previous_button)
+        pagination.addWidget(self.page_label)
+        pagination.addStretch()
+        pagination.addWidget(self.next_button)
+        layout.addLayout(pagination)
+        self.data_status = make_status_label("LISENSI: BELUM DIMUAT")
         self.data_status.setWordWrap(True)
         layout.addWidget(self.data_status)
+        self.update_action_buttons()
 
-    def load_modules(self):
-        tenant_id = self._tenant_id()
-        if tenant_id is None:
-            self._show_error("Masukkan ID Tenant berupa bilangan positif.")
-            return
-        if self.api_client is None:
-            self._show_error("Client Universal API tidak tersedia.")
-            return
-        self._start_request(tenant_id)
+    def _has_permission(self, permission):
+        return self.permissions is None or permission in self.permissions
 
-    def change_selected_module(self, action):
-        row = self.table.currentRow()
-        if row < 0:
-            self._show_error("Pilih satu modul terlebih dahulu.")
-            return
-        item = self.table.item(row, 0)
-        module_code = (
-            item.data(Qt.ItemDataRole.UserRole) if item else None
+    def set_user_permissions(self, user):
+        user_permissions = (
+            user.get("permissions") if isinstance(user, dict) else None
         )
-        tenant_id = self._tenant_id()
-        if (
-            tenant_id is None
-            or tenant_id != self.loaded_tenant_id
-            or not isinstance(module_code, str)
-        ):
+        self.permissions = (
+            set(user_permissions)
+            if isinstance(user_permissions, list)
+            else None
+        )
+        if hasattr(self, "load_button"):
+            self.update_action_buttons()
+
+    def _tenant_id(self):
+        tenant_id = self.tenant_selector.currentData()
+        return tenant_id if type(tenant_id) is int and tenant_id > 0 else None
+
+    def load_tenants(self):
+        if not self._has_permission("tenants.read"):
             self._show_error(
-                "Muat daftar modul untuk Tenant yang dipilih terlebih dahulu."
+                "Daftar Tenant memerlukan permission tenants.read."
             )
             return
         if self.api_client is None:
             self._show_error("Client Universal API tidak tersedia.")
             return
-        self._start_request(tenant_id, action, module_code)
+        self.data_status.setText("TENANT: MEMUAT DARI UNIVERSAL API...")
+        self._start_request("tenants")
 
-    def _tenant_id(self):
-        value = self.tenant_id_input.text().strip()
-        if not value.isdecimal():
-            return None
-        tenant_id = int(value)
-        return tenant_id if tenant_id > 0 else None
+    def _show_tenants(self, tenants):
+        selected_tenant_id = self._tenant_id()
+        self.tenants = tenants
+        self.tenants_by_id = {
+            tenant["id"]: tenant for tenant in tenants
+        }
+        self.tenant_selector.blockSignals(True)
+        self.tenant_selector.clear()
+        self.tenant_selector.addItem("Pilih Tenant", None)
+        selected_index = 0
+        for tenant in tenants:
+            tenant_id = tenant["id"]
+            label = (
+                f"{tenant['code']} — {tenant['name']} "
+                f"(ID {tenant_id}, {tenant['status']})"
+            )
+            self.tenant_selector.addItem(label, tenant_id)
+            if tenant_id == selected_tenant_id:
+                selected_index = self.tenant_selector.count() - 1
+        if selected_index == 0 and tenants:
+            selected_index = 1
+        self.tenant_selector.setCurrentIndex(selected_index)
+        self.tenant_selector.blockSignals(False)
+        if tenants:
+            self._tenant_changed()
+        else:
+            self.loaded_tenant_id = None
+            self.tenant_id = None
+            self.licenses = []
+            self.license_by_id = {}
+            self.table.setRowCount(0)
+            self.empty_label.setText(
+                "Belum ada Tenant terdaftar di Universal API."
+            )
+            self.empty_label.setVisible(True)
+            self.data_status.setText("TENANT: 0 DIMUAT DARI UNIVERSAL API")
+            self.update_action_buttons()
 
-    def _start_request(self, tenant_id, action=None, module_code=None):
+    def _tenant_changed(self, *_):
+        tenant_id = self._tenant_id()
+        self.tenant_id = tenant_id
+        self.loaded_tenant_id = None
+        self.offset = 0
+        self.licenses = []
+        self.license_by_id = {}
+        self.table.setRowCount(0)
+        self.page_label.setText("Halaman belum dimuat")
+        if tenant_id is None:
+            self.empty_label.setText(
+                "Pilih Tenant terdaftar untuk memuat lisensi."
+            )
+            self.empty_label.setVisible(True)
+            self.data_status.setText("LISENSI: PILIH TENANT")
+            self.update_action_buttons()
+            return
+        tenant = self.tenants_by_id.get(tenant_id)
+        if tenant is None:
+            self._show_error(
+                "Tenant tidak ditemukan pada daftar Universal API."
+            )
+            return
+        self.empty_label.setText(
+            "Tenant dipilih. Muat lisensi yang tersedia atau terbitkan "
+            "lisensi baru."
+        )
+        self.empty_label.setVisible(True)
+        self.data_status.setText(
+            f"TENANT: {tenant['code']} DIPILIH"
+        )
+        self.update_action_buttons()
+
+    def load_licenses(self, offset=0):
+        tenant_id = self._tenant_id()
+        if tenant_id is None:
+            self._show_error("Pilih Tenant terlebih dahulu.")
+            return
+        tenant = self.tenants_by_id.get(tenant_id)
+        if tenant is None:
+            self._show_error(
+                "Tenant tidak ditemukan pada daftar Universal API."
+            )
+            return
+        if not self._has_permission("tenants.read"):
+            self._show_error(
+                "Daftar lisensi memerlukan permission tenants.read."
+            )
+            return
+        if self.api_client is None:
+            self._show_error("Client Universal API tidak tersedia.")
+            return
+        self.tenant_id = tenant_id
+        self.offset = offset
+        self.licenses = []
+        self.license_by_id = {}
+        self.table.setRowCount(0)
+        self.empty_label.setText("Memuat lisensi dari Universal API...")
+        self.empty_label.setVisible(True)
+        self.data_status.setText("LISENSI: MEMUAT...")
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet("")
+        self._start_request(
+            "licenses",
+            tenant_id=tenant_id,
+            limit=self.PAGE_SIZE,
+            offset=offset,
+        )
+
+    def previous_page(self):
+        if self.offset > 0:
+            self.load_licenses(max(0, self.offset - self.PAGE_SIZE))
+
+    def next_page(self):
+        if len(self.licenses) == self.PAGE_SIZE:
+            self.load_licenses(self.offset + self.PAGE_SIZE)
+
+    def open_issue_dialog(self):
+        tenant_id = self._tenant_id()
+        if tenant_id is None:
+            self._show_error("Pilih Tenant untuk penerbitan lisensi.")
+            return
+        tenant = self.tenants_by_id.get(tenant_id)
+        if tenant is None:
+            self._show_error(
+                "Tenant tidak ditemukan pada daftar Universal API."
+            )
+            return
+        if not self._has_permission("tenants.manage"):
+            self._show_error(
+                "Penerbitan lisensi memerlukan permission tenants.manage."
+            )
+            return
+        if not self._has_permission("tenants.read"):
+            self._show_error(
+                "Pemilihan paket dan modul memerlukan permission tenants.read."
+            )
+            return
+        if self.api_client is None:
+            self._show_error("Client Universal API tidak tersedia.")
+            return
+        self.tenant_id = tenant_id
+        if self.catalogs is not None:
+            self._show_issue_dialog(self.catalogs)
+            return
+        self.data_status.setText("KATALOG LISENSI: MEMUAT DARI API...")
+        self._start_request("catalogs")
+
+    def _show_issue_dialog(self, catalogs):
+        self.issue_dialog = LicenseIssueDialog(
+            self.api_client,
+            self.tenant_id,
+            catalogs["packages"],
+            catalogs["modules"],
+            self,
+        )
+        if self.issue_dialog.exec() == QDialog.DialogCode.Accepted:
+            values = self.issue_dialog.values()
+            self.issue_dialog.wait_for_load()
+            self._start_mutation("create", **values)
+        else:
+            self.issue_dialog.wait_for_load()
+        self.issue_dialog = None
+
+    def open_mutation_dialog(self, action):
+        selected = self._selected_license()
+        tenant_id = self._tenant_id()
+        if selected is None or tenant_id != self.loaded_tenant_id:
+            self._show_error(
+                "Muat lisensi Tenant yang dipilih terlebih dahulu."
+            )
+            return
+        if not self._has_permission("tenants.manage"):
+            self._show_error(
+                "Perubahan lisensi memerlukan permission tenants.manage."
+            )
+            return
+        dialog = LicenseMutationDialog(action, selected, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        values = {
+            "tenant_id": tenant_id,
+            "license_id": _license_record_id(selected),
+            **dialog.values(),
+        }
+        if action == "status" and values["status"] == "REVOKED":
+            answer = QMessageBox.question(
+                self,
+                "Konfirmasi Pencabutan Lisensi",
+                "Lisensi yang dicabut tidak dapat dipulihkan melalui API. "
+                "Lanjutkan?",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._start_mutation(action, **values)
+
+    def _selected_license(self):
+        row = self.table.currentRow()
+        item = self.table.item(row, 0) if row >= 0 else None
+        license_id = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return self.license_by_id.get(license_id)
+
+    def _run_selected_operation(self, operation):
+        selected = self._selected_license()
+        tenant_id = self._tenant_id()
+        if selected is None or tenant_id != self.loaded_tenant_id:
+            self._show_error(
+                "Muat lisensi Tenant yang dipilih terlebih dahulu."
+            )
+            return
+        if operation == "history" and not self._has_permission(
+            "auth.audit.read"
+        ):
+            self._show_error(
+                "Riwayat lisensi memerlukan permission auth.audit.read."
+            )
+            return
+        self._start_request(
+            operation,
+            tenant_id=tenant_id,
+            license_id=_license_record_id(selected),
+        )
+
+    def _start_mutation(self, operation, **values):
+        if operation != "create" and not self._has_permission(
+            "tenants.manage"
+        ):
+            self._show_error(
+                "Perubahan lisensi memerlukan permission tenants.manage."
+            )
+            return
+        self.mutation_succeeded = False
+        self.data_status.setText("LISENSI: MENYIMPAN KE UNIVERSAL API...")
+        self._start_request(operation, **values)
+
+    def _start_request(self, operation, **values):
         if self.request_pending:
             return
         self.request_pending = True
-        self.loaded_tenant_id = None
-        self.pending_tenant_id = tenant_id
-        self.modules_by_code = {}
-        self.table.setRowCount(0)
-        self.empty_label.setText("Memuat assignment modul dari API...")
-        self.empty_label.setVisible(True)
-        self.data_status.setText("STATUS MODUL: MEMUAT...")
-        self.data_status.setStyleSheet("")
-        self.load_button.setEnabled(False)
-        self.update_action_buttons()
-        self.worker = TenantModuleWorker(
-            self.api_client, tenant_id, action, module_code
+        self.pending_operation = operation
+        self.pending_result = None
+        self.pending_error = None
+        self.worker = LicenseRequestWorker(
+            self.api_client, operation, **values
         )
-        self.worker.loaded.connect(self._show_modules)
-        self.worker.failed.connect(self._show_error)
+        self.worker.loaded.connect(self._request_loaded)
+        self.worker.failed.connect(self._request_failed)
         self.worker.finished.connect(self._request_finished)
+        self.update_action_buttons()
         self.worker.start()
 
-    def _show_modules(self, modules, message):
-        if modules is None:
-            self._show_error(message)
-            return
-        self.table.setRowCount(len(modules))
-        self.modules_by_code = {
-            module["code"]: module for module in modules
-        }
-        for row, module in enumerate(modules):
-            code_item = QTableWidgetItem(module["code"])
-            code_item.setData(
-                Qt.ItemDataRole.UserRole, module["code"]
-            )
-            self.table.setItem(row, 0, code_item)
-            self.table.setItem(
-                row, 1, QTableWidgetItem(module["name"])
-            )
-            self.table.setItem(
-                row, 2, QTableWidgetItem(module["status"])
-            )
+    def _request_loaded(self, operation, result):
+        self.pending_operation = operation
+        self.pending_result = result
 
-        self.loaded_tenant_id = self.pending_tenant_id
-        self.empty_label.setText(
-            "Tidak ada data modul dari Universal API."
+    def _request_failed(self, message):
+        self.pending_error = message
+
+    def _request_finished(self):
+        operation = self.pending_operation
+        result = self.pending_result
+        error = self.pending_error
+        self.request_pending = False
+        self.pending_result = None
+        self.pending_error = None
+        if error is not None:
+            self._show_error(error)
+        elif operation == "tenants":
+            self._show_tenants(result)
+        elif operation == "licenses":
+            self._show_licenses(result)
+        elif operation == "catalogs":
+            self.catalogs = result
+            self._show_issue_dialog(result)
+        elif operation == "detail":
+            LicenseDetailsDialog("Detail Lisensi", result, self).exec()
+            self._set_success("Detail lisensi dimuat dari Universal API.")
+        elif operation == "history":
+            LicenseHistoryDialog(result, self).exec()
+            self._set_success(
+                f"{len(result)} catatan riwayat lisensi dimuat dari Audit Log."
+            )
+        elif operation == "create":
+            serial_key = result.get("license_key")
+            license_id = result.get("license_id") or result.get("id")
+            if isinstance(serial_key, str) and serial_key:
+                issued_dialog = LicenseIssuedDialog(
+                    license_id, serial_key, self
+                )
+                issued_dialog.exec()
+                issued_dialog.clear_key()
+                result["license_key"] = ""
+            self.mutation_succeeded = True
+            self._set_success(
+                "Lisensi diterbitkan melalui Universal API. "
+                "Serial Key tidak disimpan Desktop."
+            )
+        elif operation in ("extend", "validity", "status"):
+            self.mutation_succeeded = True
+            self._set_success("Perubahan lisensi tersimpan melalui API.")
+        self.update_action_buttons()
+        if self.mutation_succeeded and self.tenant_id is not None:
+            self.load_licenses(self.offset)
+
+    def _show_licenses(self, response):
+        self.licenses = response["items"]
+        self.license_by_id = {
+            _license_record_id(record): record
+            for record in self.licenses
+        }
+        self.loaded_tenant_id = self.tenant_id
+        self.table.setRowCount(len(self.licenses))
+        for row, record in enumerate(self.licenses):
+            license_id = _license_record_id(record)
+            package = record.get("package_name") or record.get("package_id")
+            if package is None and isinstance(record.get("package"), dict):
+                package = record["package"].get("name")
+            values = (
+                license_id,
+                package or "—",
+                record.get("status") or "—",
+                record.get("valid_from") or "—",
+                record.get("valid_until") or "—",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, license_id)
+                self.table.setItem(row, column, item)
+        self.empty_label.setText("Tidak ada lisensi pada halaman ini.")
+        self.empty_label.setVisible(not self.licenses)
+        self.page_label.setText(
+            f"Halaman {self.offset // self.PAGE_SIZE + 1} — "
+            f"{len(self.licenses)} lisensi; total tidak tersedia"
         )
-        self.empty_label.setVisible(not modules)
         self.data_status.setText(
-            message or f"DATA MODUL: {len(modules)} DIMUAT DARI API"
+            f"LISENSI: {len(self.licenses)} DIMUAT DARI UNIVERSAL API"
         )
         self.data_status.setToolTip(
-            "Assignment modul bukan lisensi dan tidak menggantikan "
-            "License Manager."
+            "Lisensi dan Serial Key tetap dikelola License Manager."
         )
         self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
-        self.update_action_buttons()
+
+    def _set_success(self, message):
+        self.data_status.setText("LISENSI: " + message)
+        self.data_status.setToolTip("")
+        self.data_status.setStyleSheet(f"color:{MUTED_GOLD};")
 
     def _show_error(self, message):
-        self.data_status.setText("DATA MODUL: GAGAL")
+        self.data_status.setText("LISENSI: GAGAL — " + message)
         self.data_status.setToolTip(message)
         self.data_status.setStyleSheet("color:#A32323;")
-        self.empty_label.setText(message)
-        self.empty_label.setVisible(True)
+        if self.table.rowCount() == 0:
+            self.empty_label.setText(message)
+            self.empty_label.setVisible(True)
         self.update_action_buttons()
 
     def update_action_buttons(self, *_):
-        row = self.table.currentRow()
-        selected = self.table.item(row, 0) if row >= 0 else None
-        module_code = (
-            selected.data(Qt.ItemDataRole.UserRole)
-            if selected
-            else None
+        tenant_id = self._tenant_id()
+        tenant = self.tenants_by_id.get(tenant_id)
+        can_read = (
+            tenant is not None
+            and not self.request_pending
+            and self._has_permission("tenants.read")
         )
-        module = self.modules_by_code.get(module_code)
-        can_change = (
+        can_manage = (
+            tenant is not None
+            and not self.request_pending
+            and self._has_permission("tenants.manage")
+        )
+        can_issue = (
+            can_manage and self._has_permission("tenants.read")
+        )
+        selected = self._selected_license()
+        can_use_selection = (
+            selected is not None
+            and tenant_id == self.loaded_tenant_id
+            and not self.request_pending
+        )
+        self.tenant_selector.setEnabled(not self.request_pending)
+        self.load_tenants_button.setEnabled(
             not self.request_pending
-            and self._tenant_id() == self.loaded_tenant_id
-            and module is not None
+            and self._has_permission("tenants.read")
         )
-        self.load_button.setEnabled(not self.request_pending)
-        self.enable_button.setEnabled(
-            can_change
-            and module["is_active"]
-            and module["status"] in ("DISABLED", "UNASSIGNED")
+        self.load_button.setEnabled(can_read)
+        self.issue_button.setEnabled(can_issue)
+        self.detail_button.setEnabled(can_use_selection and can_read)
+        self.history_button.setEnabled(
+            can_use_selection
+            and self._has_permission("auth.audit.read")
         )
-        self.disable_button.setEnabled(
-            can_change
-            and module["status"] == "ENABLED"
-            and module["code"] != "CORE"
+        self.status_button.setEnabled(can_use_selection and can_manage)
+        self.validity_button.setEnabled(can_use_selection and can_manage)
+        self.extend_button.setEnabled(can_use_selection and can_manage)
+        self.previous_button.setEnabled(
+            not self.request_pending and self.offset > 0
         )
-
-    def _request_finished(self):
-        self.request_pending = False
-        self.update_action_buttons()
+        self.next_button.setEnabled(
+            not self.request_pending and len(self.licenses) == self.PAGE_SIZE
+        )
 
     def wait_for_load(self):
-        if self.worker and self.worker.isRunning():
+        if self.worker is not None:
             self.worker.wait()
+        if self.issue_dialog is not None:
+            self.issue_dialog.wait_for_load()
 
 
 class DataPage(QWidget):
@@ -4629,7 +5552,7 @@ class MainWindow(QMainWindow):
         pages = {
             "dashboard": DashboardPage(self.api_client),
             "tenants": TenantPage(self.api_client),
-            "licenses": LicensePage(self.api_client),
+            "licenses": LicensePage(self.api_client, self.user),
             "installations": InstallationPage(self.api_client),
             "modules": ModulePage(self.api_client),
             "developers": DeveloperPage(self.api_client),
@@ -4715,6 +5638,9 @@ class MainWindow(QMainWindow):
                 self.user.get("full_name")
                 or self.user.get("username", "")
             )
+            license_page = self.page_by_key.get("licenses")
+            if license_page is not None:
+                license_page.set_user_permissions(self.user)
             self.navigate("dashboard")
             self.start_connection_check()
             return
@@ -4772,6 +5698,8 @@ class MainWindow(QMainWindow):
             return
         self.pages.setCurrentWidget(page)
         if page_key == "tenants" and self.api_client:
+            page.load_tenants()
+        if page_key == "licenses" and self.api_client:
             page.load_tenants()
         if page_key == "installations" and self.api_client:
             page.load_installations()

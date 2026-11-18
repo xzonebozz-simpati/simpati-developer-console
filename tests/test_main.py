@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QMessageBox,
     QPushButton,
     QTableWidgetItem,
@@ -34,6 +35,10 @@ from main import (
     FormDialog,
     InstallationPage,
     LicensePage,
+    LicenseIssueDialog,
+    LicenseIssuedDialog,
+    LicenseMutationDialog,
+    LicenseDetailsDialog,
     MainWindow,
     ModulePage,
     PasswordChangeDialog,
@@ -358,73 +363,294 @@ class DesktopApplicationTests(unittest.TestCase):
         load_dashboard.assert_called_once_with()
         self.assertEqual(checks, [True])
 
-    def test_license_page_uses_api_module_assignment_without_fake_licenses(self):
+    def test_license_page_loads_license_records_from_universal_api(self):
         class FakeApiClient:
             def __init__(self):
-                self.enabled = False
-                self.enable_calls = []
                 self.list_calls = []
 
-            def list_tenant_modules(self, tenant_id):
-                self.list_calls.append(tenant_id)
+            def list_tenants(self):
                 return [
                     {
-                        "id": 1,
-                        "code": "CORE",
-                        "name": "Core",
-                        "is_active": True,
-                        "is_assigned": True,
-                        "is_enabled": True,
-                        "status": "ENABLED",
-                    },
-                    {
-                        "id": 2,
-                        "code": "SURVEI_GPS",
-                        "name": "Survei GPS",
-                        "is_active": True,
-                        "is_assigned": self.enabled,
-                        "is_enabled": self.enabled,
-                        "status": "ENABLED" if self.enabled else "UNASSIGNED",
-                    },
+                        "id": 31,
+                        "code": "TENANT-31",
+                        "name": "Tenant 31",
+                        "status": "ACTIVE",
+                    }
                 ]
 
-            def enable_tenant_module(self, tenant_id, module_code):
-                self.enable_calls.append((tenant_id, module_code))
-                self.enabled = True
-
-            def disable_tenant_module(self, tenant_id, module_code):
-                self.enabled = False
+            def list_tenant_licenses(self, tenant_id, limit, offset):
+                self.list_calls.append((tenant_id, limit, offset))
+                return {
+                    "items": [
+                        {
+                            "id": (
+                                "e536cdd2-9952-4c33-9caf-789df6477bbb"
+                            ),
+                            "package_id": (
+                                "58dd22e7-35a2-43c2-9d8c-e34c480d5908"
+                            ),
+                            "status": "ACTIVE",
+                            "valid_from": "2026-01-01T00:00:00Z",
+                            "valid_until": "2027-01-01T00:00:00Z",
+                        }
+                    ],
+                    "limit": limit,
+                    "offset": offset,
+                }
 
         api_client = FakeApiClient()
-        page = LicensePage(api_client)
-        self.addCleanup(page.close)
-        self.assertIn(
-            "belum menyediakan model atau endpoint lisensi",
-            page.license_note.text(),
+        page = LicensePage(
+            api_client,
+            {
+                "permissions": [
+                    "tenants.read",
+                    "tenants.manage",
+                    "auth.audit.read",
+                ]
+            },
         )
+        self.addCleanup(page.close)
+        self.assertIn("License Manager", page.license_note.text())
 
-        page.tenant_id_input.setText("31")
+        page.load_tenants()
+        page.wait_for_load()
+        self.app.processEvents()
+        self.assertEqual(page.tenant_selector.currentData(), 31)
         page.load_button.click()
         page.wait_for_load()
         self.app.processEvents()
 
-        self.assertEqual(page.table.rowCount(), 2)
-        self.assertEqual(api_client.list_calls, [31])
-        survei_row = next(
-            row
-            for row in range(page.table.rowCount())
-            if page.table.item(row, 0).text() == "SURVEI_GPS"
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(api_client.list_calls, [(31, 50, 0)])
+        self.assertEqual(
+            page.table.item(0, 0).text(),
+            "e536cdd2-9952-4c33-9caf-789df6477bbb",
         )
-        page.table.selectRow(survei_row)
-        self.assertTrue(page.enable_button.isEnabled())
-        self.assertFalse(page.disable_button.isEnabled())
+        self.assertEqual(page.table.item(0, 2).text(), "ACTIVE")
+        page.table.selectRow(0)
+        self.assertTrue(page.detail_button.isEnabled())
+        self.assertTrue(page.history_button.isEnabled())
+        self.assertFalse(hasattr(page, "enable_button"))
 
-        page.enable_button.click()
+    def test_license_page_respects_license_permissions(self):
+        class FakeApiClient:
+            def list_tenants(self):
+                return [
+                    {
+                        "id": 31,
+                        "code": "TENANT-31",
+                        "name": "Tenant 31",
+                        "status": "ACTIVE",
+                    }
+                ]
+
+        page = LicensePage(
+            FakeApiClient(),
+            {"permissions": ["tenants.read"]},
+        )
+        self.addCleanup(page.close)
+        page.load_tenants()
         page.wait_for_load()
         self.app.processEvents()
 
-        self.assertEqual(api_client.enable_calls, [(31, "SURVEI_GPS")])
-        self.assertEqual(page.table.item(survei_row, 2).text(), "ENABLED")
+        self.assertTrue(page.load_button.isEnabled())
+        self.assertFalse(page.issue_button.isEnabled())
+        self.assertFalse(page.history_button.isEnabled())
+
+    def test_license_page_lists_tenants_without_licenses_for_issuance(self):
+        class FakeApiClient:
+            def __init__(self):
+                self.license_calls = []
+
+            def list_tenants(self):
+                return [
+                    {
+                        "id": 31,
+                        "code": "TENANT-31",
+                        "name": "Tenant With Licenses",
+                        "status": "ACTIVE",
+                    },
+                    {
+                        "id": 32,
+                        "code": "TENANT-32",
+                        "name": "Tenant Without Licenses",
+                        "status": "ACTIVE",
+                    },
+                    {
+                        "id": 33,
+                        "code": "TENANT-33",
+                        "name": "Registered Inactive Tenant",
+                        "status": "INACTIVE",
+                    },
+                ]
+
+            def list_tenant_licenses(self, tenant_id, limit, offset):
+                self.license_calls.append((tenant_id, limit, offset))
+                return {"items": [], "limit": limit, "offset": offset}
+
+        api_client = FakeApiClient()
+        page = LicensePage(
+            api_client,
+            {
+                "permissions": [
+                    "tenants.read",
+                    "tenants.manage",
+                ]
+            },
+        )
+        self.addCleanup(page.close)
+
+        page.load_tenants()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(page.tenant_selector.count(), 4)
+        self.assertEqual(page.tenant_selector.itemData(1), 31)
+        self.assertEqual(page.tenant_selector.itemData(2), 32)
+        self.assertEqual(page.tenant_selector.itemData(3), 33)
+        self.assertIn(
+            "Tenant Without Licenses",
+            page.tenant_selector.itemText(2),
+        )
+        page.tenant_selector.setCurrentIndex(3)
+        self.assertTrue(page.load_button.isEnabled())
+        self.assertTrue(page.issue_button.isEnabled())
+        page.tenant_selector.setCurrentIndex(2)
+        self.assertTrue(page.issue_button.isEnabled())
+        page.load_button.click()
+        page.wait_for_load()
+        self.app.processEvents()
+
+        self.assertEqual(api_client.license_calls, [(32, 50, 0)])
+        self.assertEqual(page.table.rowCount(), 0)
+        self.assertTrue(page.issue_button.isEnabled())
+        page.catalogs = {"packages": [], "modules": []}
+        with patch.object(page, "_show_issue_dialog") as show_dialog:
+            page.issue_button.click()
+
+        self.assertEqual(page.tenant_id, 32)
+        show_dialog.assert_called_once_with(page.catalogs)
+
+    def test_license_issue_dialog_loads_package_modules_from_api(self):
+        package_id = "58dd22e7-35a2-43c2-9d8c-e34c480d5908"
+
+        class FakeApiClient:
+            def get_license_package(self, selected_id):
+                self.selected_package = selected_id
+                return {
+                    "id": package_id,
+                    "is_active": True,
+                    "package_modules": [
+                        {"module_code": "CORE", "is_mandatory": True},
+                        {
+                            "module_code": "SURVEI_GPS",
+                            "is_mandatory": False,
+                        },
+                    ],
+                }
+
+        dialog = LicenseIssueDialog(
+            FakeApiClient(),
+            31,
+            [{"id": package_id, "name": "Professional"}],
+            [
+                {
+                    "module_code": "CORE",
+                    "name": "Core",
+                    "is_active": True,
+                },
+                {
+                    "module_code": "SURVEI_GPS",
+                    "name": "Survei GPS",
+                    "is_active": True,
+                },
+            ],
+        )
+        self.addCleanup(dialog.close)
+        dialog.package_worker.wait()
+        self.app.processEvents()
+
+        values = dialog.values()
+        self.assertEqual(values["tenant_id"], 31)
+        self.assertEqual(values["package_id"], package_id)
+        self.assertEqual(values["modules"], ["CORE"])
+        self.assertEqual(values["max_installations"], 1)
+        self.assertEqual(values["max_members"], 50000)
+        self.assertEqual(values["max_accounts"], 200)
+        self.assertEqual(values["max_concurrent_users"], 25)
+        self.assertEqual(values["max_storage_mb"], 20480)
+        self.assertTrue(dialog.submit_button.isEnabled())
+        dialog.module_list.item(1).setCheckState(Qt.CheckState.Checked)
+        self.assertEqual(
+            dialog.values()["modules"], ["CORE", "SURVEI_GPS"]
+        )
+
+    def test_license_mutation_dialogs_collect_api_required_values(self):
+        license_record = {
+            "status": "ACTIVE",
+            "valid_from": "2026-01-01T00:00:00Z",
+            "valid_until": "2027-01-01T00:00:00Z",
+            "grace_period_days": 7,
+        }
+        status_dialog = LicenseMutationDialog("status", license_record)
+        self.addCleanup(status_dialog.close)
+        status_dialog.status_input.setCurrentText("SUSPENDED")
+        status_dialog.reason_input.setText("Compliance review")
+        self.assertEqual(
+            status_dialog.values(),
+            {"status": "SUSPENDED", "reason": "Compliance review"},
+        )
+
+        validity_dialog = LicenseMutationDialog(
+            "validity", license_record
+        )
+        self.addCleanup(validity_dialog.close)
+        validity_dialog.reason_input.setText("Corrected dates")
+        self.assertEqual(
+            validity_dialog.values()["grace_period_days"], 7
+        )
+        self.assertEqual(
+            validity_dialog.values()["reason"], "Corrected dates"
+        )
+
+        extension_dialog = LicenseMutationDialog(
+            "extend", license_record
+        )
+        self.addCleanup(extension_dialog.close)
+        extension_dialog.reason_input.setText("Renewed")
+        self.assertEqual(
+            extension_dialog.values()["reason"], "Renewed"
+        )
+
+    def test_issued_serial_key_can_be_cleared_after_one_time_display(self):
+        serial_key = "SMP-LIC-2026-0123456789ABCDEF-FEDCBA9876543210"
+        dialog = LicenseIssuedDialog("license-id", serial_key)
+        self.addCleanup(dialog.close)
+
+        self.assertTrue(dialog.serial_key_input.isReadOnly())
+        self.assertEqual(dialog.serial_key_input.text(), serial_key)
+        dialog.clear_key()
+        self.assertEqual(dialog.serial_key_input.text(), "")
+
+    def test_license_details_never_display_serial_key_or_credentials(self):
+        serial_key = "SMP-LIC-2026-0123456789ABCDEF-FEDCBA9876543210"
+        dialog = LicenseDetailsDialog(
+            "Detail Lisensi",
+            {
+                "id": "license-id",
+                "license_key": serial_key,
+                "notes": f"legacy {serial_key}",
+                "access_token": "private-token",
+                "status": "ACTIVE",
+            },
+        )
+        self.addCleanup(dialog.close)
+
+        text = dialog.findChild(QPlainTextEdit).toPlainText()
+        self.assertNotIn(serial_key, text)
+        self.assertNotIn("private-token", text)
+        self.assertIn("[REDACTED]", text)
+        self.assertIn("ACTIVE", text)
 
     def test_installation_page_shows_server_list_and_tenant_scoped_detail(self):
         installation = {
